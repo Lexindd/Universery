@@ -7,6 +7,7 @@ if DbgSec ~= nil then
 	El.DbgFOV = DbgSec:Label({ Text = "Prediction: -" })
 	El.SilentDbg = DbgSec:Label({ Text = "Silent: OFF" })
 	El.SilentDbg2 = DbgSec:Label({ Text = "Fire: -" })
+	El.SilentDbg3 = DbgSec:Label({ Text = "Checks: -" })
 
 	El.AimbotDebugger = DbgSec:Toggle({
 		Name = "Aimbot Print Debugger",
@@ -82,6 +83,16 @@ task.spawn(function()
 				.. " | Hits: " .. tostring(sinfo.HookHits or 0)
 				.. " | AW: " .. tostring(sinfo.Aimwork or "?")
 				.. " | Cam: UNCHANGED")
+			local awd = sinfo.AWDiag
+			if type(awd) ~= "table" then
+				awd = {}
+			end
+			SetLabel(El.SilentDbg3, "AW src/class/inst/trk/iter: "
+				.. tostring(awd.source) .. "/" .. tostring(awd.class) .. "/"
+				.. tostring(awd.instance) .. "/" .. tostring(awd.tracker) .. "/"
+				.. tostring(awd.iterate) .. " | Sel: " .. tostring(awd.selected)
+				.. " | Pred: " .. tostring(sinfo.Predicted or "-")
+				.. " | Dir: " .. tostring(sinfo.AimDirection or "-"))
 		end
 	end
 end)

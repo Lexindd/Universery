@@ -2858,6 +2858,7 @@ A._instance = nil
 A._state = "NOT INSTALLED"
 A._detail = "Libraries/Aimwork source not present"
 A._cooldownUntil = 0
+A._diag = { source = false, class = false, instance = false, tracker = false, iterate = false, selected = "NONE" }
 
 local fovOrigin = nil
 local fovRadius = 150
@@ -2892,6 +2893,19 @@ function A.IsReady()
 	return A._state == "READY" and A._instance ~= nil
 end
 
+function A.Diag()
+	return {
+		source = A._diag.source,
+		class = A._diag.class,
+		instance = A._diag.instance,
+		tracker = A._diag.tracker,
+		iterate = A._diag.iterate,
+		selected = A._diag.selected,
+		state = A._state,
+		detail = A._detail,
+	}
+end
+
 function A.State()
 	return A._state, A._detail
 end
@@ -2908,10 +2922,9 @@ function A.BuildConfig(S)
 	if S ~= nil and S.IncludeDeadTargets then
 		dead = false
 	end
-	local wall = false
-	if S ~= nil and S.VisibilityCheck then
-		wall = "Full"
-	end
+	-- Visibility is decided SOLELY by Universery post-validation (cached raycasts).
+	-- Aimwork keeps only the cheap on-screen gate so both systems agree.
+	local wall = "OnScreen"
 	local pfType, pfName = "Blocklist", {}
 	local mode = S ~= nil and S.TargetPart or "Head"
 	if mode == "Head" or mode == "HumanoidRootPart" or mode == "UpperTorso" or mode == "LowerTorso" then
@@ -2973,6 +2986,7 @@ function A.Ensure(S)
 		A._cooldownUntil = tick() + 5
 		return false
 	end
+	A._diag.source = Universery.AimworkSources ~= nil
 	local okC, class = pcall(function() return loader.Load("aimwork") end)
 	if not okC or type(class) ~= "table" or type(class.new) ~= "function" then
 		A._state = "NOT COMPATIBLE"
@@ -2981,6 +2995,7 @@ function A.Ensure(S)
 		return false
 	end
 	A._class = class
+	A._diag.class = true
 	local okN, inst = pcall(function() return class.new(A.BuildConfig(S)) end)
 	if not okN or inst == nil then
 		A._state = "ERROR"
@@ -2989,6 +3004,17 @@ function A.Ensure(S)
 		return false
 	end
 	A._instance = inst
+	local hasTracker = false
+	pcall(function()
+		hasTracker = inst.checks ~= nil and inst.checks.playerTracker ~= nil
+	end)
+	A._diag.tracker = hasTracker and true or false
+	if not hasTracker then
+		A._state = "ERROR"
+		A._detail = "player tracker missing"
+		A._cooldownUntil = tick() + 5
+		return false
+	end
 	local okR = pcall(function() return inst:RegisterCustomFov(headless) end)
 	if not okR then
 		pcall(function()
@@ -3005,6 +3031,7 @@ function A.Update()
 		return false
 	end
 	local ok = pcall(function() return A._instance:Iterate() end)
+	A._diag.iterate = ok and true or false
 	return ok
 end
 
@@ -3036,8 +3063,12 @@ function A.GetTarget()
 	pcall(function() pname = pt.Name end)
 	pcall(function() sdist = sel.distance end)
 	if pos == nil then
+		A._diag.selected = "NONE"
 		return nil
 	end
+	local nm = nil
+	pcall(function() nm = pl.Name end)
+	A._diag.selected = nm or "?"
 	return { Player = pl, Part = pt, PartName = pname, Position = pos, Distance = sdist }
 end
 
@@ -3046,6 +3077,8 @@ function A.Teardown()
 		pcall(function() return A._instance:Destroy() end)
 		A._instance = nil
 	end
+	A._diag.selected = "NONE"
+	A._diag.iterate = false
 	if A._state == "READY" then
 		A._state = "BOUND"
 		A._detail = "stopped"
@@ -3054,20 +3087,22 @@ end
 
 return Universery.AimworkAdapter
 end
-__Modules["Features/SilentAim/FireAdapter"] = function(Require)
--- Features/SilentAim/FireAdapter.lua — Generic fire adapter (camera-read hook).
+__Modules["Features/SilentAim/Adapters/Generic"] = function(Require)
+-- Features/SilentAim/Adapters/Generic.lua — Generic fire adapter (camera-read hook).
 -- Universal ONLY: serves aim-oriented values to Lua weapon code while the
 -- C++ renderer keeps showing the real view (zero visual movement possible).
--- Game-specific adapters live behind RegisterAdapter (isolated, PlaceId-keyed)
--- and are tried BEFORE the generic hook when applying.
--- Interface used by SilentAim controller:
+-- Game-specific adapters live in sibling Registry (isolated, PlaceId-keyed).
+-- Interface (called via Facade):
 --   Probe() IsHooked() Engage() Release() Uninstall()
 --   SetAim(pos, cf, org) SetCamera(cam) SetOverride(on) IsOverriding()
---   Hits() Info() RegisterAdapter(gameId, adapter) ApplyCustom(pos, cf)
+--   Hits() Reads() Info()
+-- Read detection (Mouse.Hit/Target/UnitRay) is COUNT-ONLY: values are never
+-- altered (spoofing ban upheld); it exists to identify the game's aim source.
 
 local Universery = Require("registry")
-Universery.SilentFire = Universery.SilentFire or {}
-local F = Universery.SilentFire
+Universery.SilentGeneric = Universery.SilentGeneric or {}
+local F = Universery.SilentGeneric
+local LPH = LPH_NO_VIRTUALIZE or function(f) return f end
 
 F._hooked = false
 F._hits = 0
@@ -3081,6 +3116,8 @@ F._org = nil
 F._raw = nil
 F._probed = false
 F._avail = false
+F._mouse = nil
+F._reads = {}
 
 function F.Probe()
 	if F._probed then
@@ -3133,6 +3170,9 @@ function F.HookFn(self, key)
 			end
 		end
 	end
+	if F._mouse ~= nil and self == F._mouse and (key == "Hit" or key == "Target" or key == "UnitRay") then
+		F._reads[key] = (F._reads[key] or 0) + 1
+	end
 	return F._raw(self, key)
 end
 
@@ -3145,7 +3185,7 @@ function F.Engage()
 	end
 	local ok = false
 	pcall(function()
-		local wrap = LPH_NO_VIRTUALIZE
+		local wrap = LPH
 		pcall(function()
 			if type(newcclosure) == "function" then
 				wrap = newcclosure
@@ -3220,6 +3260,13 @@ end
 
 function F.SetCamera(cam)
 	F._cam = cam
+	pcall(function()
+		local plrs = game:GetService("Players")
+		local lp = plrs.LocalPlayer
+		if lp ~= nil then
+			F._mouse = lp:GetMouse()
+		end
+	end)
 end
 
 function F.SetOverride(on)
@@ -3231,40 +3278,164 @@ function F.Hits()
 end
 
 function F.Info()
-	return { hooked = F._hooked, how = F._how, error = F._error, hits = F._hits or 0 }
+	return { hooked = F._hooked, how = F._how, error = F._error, hits = F._hits or 0, reads = F.Reads() }
 end
 
-function F.RegisterAdapter(gameId, adapter)
+
+
+
+function F.Reads()
+	local r = {}
+	for k, v in next, F._reads do
+		r[k] = v
+	end
+	return r
+end
+
+return Universery.SilentGeneric
+end
+__Modules["Features/SilentAim/Adapters/Registry"] = function(Require)
+-- Features/SilentAim/Adapters/Registry.lua — game-specific adapter registry.
+-- Isolated per PlaceId; the universal core never hardcodes game logic.
+-- Adapter contract (all optional except Apply):
+--   { Apply = function(self, pos, cf) -> boolean,
+--     GetOrigin = function(self) -> Vector3|nil,
+--     ConfirmHit = function(self, info) -> boolean }
+
+local Universery = Require("registry")
+Universery.SilentRegistry = Universery.SilentRegistry or {}
+local R = Universery.SilentRegistry
+
+R._byGame = R._byGame or {}
+R._generic = R._generic
+
+function R.Register(gameId, adapter)
 	if type(adapter) ~= "table" then
 		return false
 	end
 	if gameId == "*" then
-		F._generic = adapter
+		R._generic = adapter
 	else
-		F._byGame = F._byGame or {}
-		F._byGame[tonumber(gameId) or gameId] = adapter
+		R._byGame[tonumber(gameId) or gameId] = adapter
 	end
 	return true
 end
 
-function F.ResolveAdapter()
+function R.Resolve()
 	local gameId = nil
 	pcall(function()
 		if game ~= nil then
 			gameId = game.PlaceId or game.GameId
 		end
 	end)
-	if gameId ~= nil and F._byGame ~= nil and F._byGame[gameId] ~= nil then
-		return F._byGame[gameId], tostring(gameId)
+	if gameId ~= nil and R._byGame[gameId] ~= nil then
+		return R._byGame[gameId], tostring(gameId)
 	end
-	if F._generic ~= nil then
-		return F._generic, "generic"
+	if R._generic ~= nil then
+		return R._generic, "generic"
 	end
 	return nil, "none"
 end
 
+function R.List()
+	local ids = {}
+	for id, _ in next, R._byGame do
+		ids[#ids + 1] = tostring(id)
+	end
+	return ids
+end
+
+return Universery.SilentRegistry
+end
+__Modules["Features/SilentAim/FireAdapter"] = function(Require)
+-- Features/SilentAim/FireAdapter.lua — thin facade over Generic + Registry.
+-- The controller talks ONLY to this facade; engine and game adapters stay
+-- behind it. No weapon/game logic lives here.
+
+local Universery = Require("registry")
+Universery.SilentFire = Universery.SilentFire or {}
+local F = Universery.SilentFire
+
+local function G()
+	return Universery.SilentGeneric
+end
+
+local function R()
+	return Universery.SilentRegistry
+end
+
+function F.Probe()
+	return G().Probe()
+end
+
+function F.Engage()
+	return G().Engage()
+end
+
+function F.Uninstall()
+	G().Uninstall()
+end
+
+function F.IsHooked()
+	return G().IsHooked()
+end
+
+function F.IsOverriding()
+	return G().IsOverriding()
+end
+
+function F.SetAim(pos, cf, org)
+	G().SetAim(pos, cf, org)
+end
+
+function F.ClearAim()
+	G().ClearAim()
+end
+
+function F.SetCamera(cam)
+	G().SetCamera(cam)
+end
+
+function F.SetOverride(on)
+	G().SetOverride(on)
+end
+
+function F.Hits()
+	return G().Hits()
+end
+
+function F.Reads()
+	return G().Reads()
+end
+
+function F.Info()
+	return G().Info()
+end
+
+function F.GetOrigin()
+	local reg = R()
+	if reg ~= nil then
+		local adapter = reg.Resolve()
+		if adapter ~= nil and type(adapter.GetOrigin) == "function" then
+			local ok, org = pcall(adapter.GetOrigin, adapter)
+			if ok and org ~= nil then
+				return org
+			end
+		end
+	end
+	return nil
+end
+
+function F.RegisterAdapter(gameId, adapter)
+	return R().Register(gameId, adapter)
+end
+
+function F.ResolveAdapter()
+	return R().Resolve()
+end
+
 function F.ApplyCustom(pos, cf)
-	local adapter, _ = F.ResolveAdapter()
+	local adapter = R().Resolve()
 	if adapter ~= nil and type(adapter.Apply) == "function" then
 		local ok = pcall(adapter.Apply, adapter, pos, cf)
 		if ok then
@@ -3275,6 +3446,188 @@ function F.ApplyCustom(pos, cf)
 end
 
 return Universery.SilentFire
+end
+__Modules["Features/SilentAim/FireState"] = function(Require)
+-- Features/SilentAim/FireState.lua — fire-event abstraction (no MB1 monopoly).
+-- Detects the actual supported firing pathways in this environment:
+--   * MouseButton1 press/hold (polled; capability-probed, not assumed)
+--   * Tool.Activated on the local character's tools (wired per character)
+-- Exposes: IsFiring() / GetLastFireTime() / OnFire(callback) / Reset() /
+-- Capabilities(). Override decisions consume IsFiring(), never raw MB1 state.
+
+local Universery = Require("registry")
+Universery.FireState = Universery.FireState or {}
+local FS = Universery.FireState
+
+FS._mbHeld = false
+FS._mbPrev = false
+FS._mbTime = 0
+FS._toolChar = nil
+FS._toolConns = {}
+FS._toolTime = 0
+FS._listeners = {}
+FS._caps = nil
+
+local function now()
+	local ok, t = pcall(function() return tick() end)
+	if ok and type(t) == "number" then
+		return t
+	end
+	return 0
+end
+
+local function uis()
+	local ok, u = pcall(function() return game:GetService("UserInputService") end)
+	if ok then
+		return u
+	end
+	return nil
+end
+
+function FS.Capabilities()
+	if FS._caps ~= nil then
+		return FS._caps
+	end
+	local caps = { MouseButton1 = false, ToolActivated = true }
+	pcall(function()
+		local u = uis()
+		if u ~= nil then
+			u:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+			caps.MouseButton1 = true
+		end
+	end)
+	FS._caps = caps
+	return caps
+end
+
+local function fireEvent(source)
+	local t = now()
+	if source == "mb" then
+		FS._mbTime = t
+	else
+		FS._toolTime = t
+	end
+	for _, fn in next, FS._listeners do
+		pcall(fn, source)
+	end
+end
+
+function FS.Poll()
+	local caps = FS.Capabilities()
+	if not caps.MouseButton1 then
+		return FS._mbHeld
+	end
+	local held = false
+	pcall(function()
+		local u = uis()
+		if u ~= nil then
+			held = u:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) and true or false
+		end
+	end)
+	FS._mbHeld = held
+	if held and not FS._mbPrev then
+		fireEvent("mb")
+	end
+	FS._mbPrev = held
+	return held
+end
+
+local function trackTool(tool)
+	local ok, conn = pcall(function()
+		return tool.Activated:Connect(function()
+			fireEvent("tool")
+		end)
+	end)
+	if ok and conn ~= nil then
+		FS._toolConns[#FS._toolConns + 1] = conn
+	end
+end
+
+function FS.RefreshTools()
+	local ch = nil
+	pcall(function()
+		local plrs = game:GetService("Players")
+		local lp = plrs.LocalPlayer
+		if lp ~= nil then
+			ch = lp.Character
+		end
+	end)
+	if ch == FS._toolChar then
+		return
+	end
+	for _, c in next, FS._toolConns do
+		pcall(function() c:Disconnect() end)
+	end
+	FS._toolConns = {}
+	FS._toolChar = ch
+	if ch == nil then
+		return
+	end
+	pcall(function()
+		for _, d in next, ch:GetChildren() do
+			if d:IsA("Tool") then
+				trackTool(d)
+			end
+		end
+	end)
+	pcall(function()
+		local okC, conn = pcall(function()
+			return ch.ChildAdded:Connect(function(d)
+				pcall(function()
+					if d:IsA("Tool") then
+						trackTool(d)
+					end
+				end)
+			end)
+		end)
+		if okC and conn ~= nil then
+			FS._toolConns[#FS._toolConns + 1] = conn
+		end
+	end)
+end
+
+function FS.IsFiring()
+	if FS._mbHeld then
+		return true
+	end
+	local t = now()
+	if (t - (FS._mbTime or 0)) < 0.15 then
+		return true
+	end
+	if (t - (FS._toolTime or 0)) < 0.15 then
+		return true
+	end
+	return false
+end
+
+function FS.GetLastFireTime()
+	local a = FS._mbTime or 0
+	local b = FS._toolTime or 0
+	if a > b then
+		return a
+	end
+	return b
+end
+
+function FS.OnFire(callback)
+	if type(callback) == "function" then
+		FS._listeners[#FS._listeners + 1] = callback
+	end
+end
+
+function FS.Reset()
+	for _, c in next, FS._toolConns do
+		pcall(function() c:Disconnect() end)
+	end
+	FS._toolConns = {}
+	FS._toolChar = nil
+	FS._mbHeld = false
+	FS._mbPrev = false
+	FS._mbTime = 0
+	FS._toolTime = 0
+end
+
+return Universery.FireState
 end
 __Modules["Shared/TeamResolver"] = function(Require)
 -- Shared/TeamResolver.lua — the single team-detection system.
@@ -4006,7 +4359,10 @@ local Universery = Require("registry")
 Require("gen/aimwork_blobs")
 Require("Libraries/Aimwork/loader")
 Require("Features/SilentAim/AimworkAdapter")
+Require("Features/SilentAim/Adapters/Generic")
+Require("Features/SilentAim/Adapters/Registry")
 Require("Features/SilentAim/FireAdapter")
+Require("Features/SilentAim/FireState")
 Require("Shared/TeamResolver")
 -- Universery + MacLib (SINGLE FILE)
 -- Tek dosya: aimbot gomulu gelir (auto-start, OFF baslar), tum kontrol MacLib UI uzerinden.
@@ -7519,7 +7875,7 @@ function SilentAim.Validate(player, S, cam, camPos, viewport, origin, overPos, o
 	if overPos ~= nil then
 		partPos, partName = overPos, overName or (S.TargetPart or "Head")
 	else
-		partPos, partName = SilentAim.ResolvePart(Character, S.TargetPart or "Head", origin, cam)
+		partPos, partName = SilentAim.ResolvePart(Character, player, S.TargetPart or "Head", origin, cam)
 	end
 	if partPos == nil then
 		return bad
@@ -7595,8 +7951,10 @@ function SilentAim.UpdateOrientation()
 		return
 	end
 	local cam = workspace.CurrentCamera or Camera
-	local origin = nil
-	pcall(function() origin = cam.CFrame.Position end)
+	local origin = Universery.SilentFire.GetOrigin()
+	if origin == nil then
+		pcall(function() origin = cam.CFrame.Position end)
+	end
 	if origin == nil then
 		SilentAim.AimCFrame = nil
 		return
@@ -7823,12 +8181,10 @@ function SilentAim.Frame(dt)
 		Fire.Uninstall()
 	end
 	pcall(function() Fire.SetCamera(workspace.CurrentCamera or Camera) end)
-	local okMB, mb = pcall(function() return __index(UserInputService, "IsMouseButtonPressed")(UserInputService, Enum.UserInputType.MouseButton1) end)
-	SilentAim.FireHeld = (okMB and mb) and true or false
-	if SilentAim.FireHeld and not SilentAim.PrevFireHeld then
-		SilentAim.LastFireEvent = tick()
-	end
-	SilentAim.PrevFireHeld = SilentAim.FireHeld
+	local FS = Universery.FireState
+	FS.Poll()
+	FS.RefreshTools()
+	SilentAim.FireHeld = FS.IsFiring()
 	SilentAim.ScanAccum = SilentAim.ScanAccum + (dt or 0.016)
 	if SilentAim.ScanAccum >= (1 / 45) then
 		SilentAim.ScanAccum = 0
@@ -7838,7 +8194,7 @@ function SilentAim.Frame(dt)
 			SilentAim.Clear()
 		end
 	end
-	local firing = SilentAim.FireHeld or (tick() - (SilentAim.LastFireEvent or 0)) < 0.15
+	local firing = FS.IsFiring()
 	local armed = SilentAim.IsArmed()
 	Fire.SetAim(SilentAim.PredictedPos, SilentAim.AimCFrame, SilentAim.HookOrigin)
 	Fire.SetOverride(Fire.IsHooked() and armed and SilentAim.Target ~= nil and SilentAim.PredictedPos ~= nil and firing)
@@ -7885,6 +8241,7 @@ function SilentAim.Shutdown()
 	if Universery.AimworkAdapter ~= nil then
 		pcall(Universery.AimworkAdapter.Teardown)
 	end
+	Universery.FireState.Reset()
 	if SilentAim.FOVCircle ~= nil then
 		pcall(function() SilentAim.FOVCircle:Remove() end)
 		SilentAim.FOVCircle = nil
@@ -7936,12 +8293,65 @@ Environment.GetSilentInfo = LPH_NO_VIRTUALIZE(function()
 			awState = tostring(stAW)
 		end
 	end
+	local awDiag = nil
+	if Universery.AimworkAdapter ~= nil then
+		pcall(function()
+			local d = Universery.AimworkAdapter.Diag()
+			if type(d) == "table" then
+				awDiag = d
+			end
+		end)
+	end
 	local pipe = "NOT CONNECTED"
 	if hasApplier or regAdapter ~= nil then
 		pipe = "CUSTOM"
 	elseif Fire2.IsHooked() then
 		pipe = "HOOKED"
 	end
+	local awDiag = { source = false, class = false, instance = false, tracker = false, iterate = false, selected = "NONE" }
+	if Universery.AimworkAdapter ~= nil then
+		pcall(function()
+			local d = Universery.AimworkAdapter.Diag()
+			if type(d) == "table" then
+				awDiag = d
+			end
+		end)
+	end
+	local effT, velM, predPos = 0, 0, nil
+	if S.Prediction then
+		if PingState.Available and (PingState.Effective or 0) > 0 then
+			effT = PingState.Effective
+		else
+			effT = 0.1
+		end
+	end
+	if SilentAim.Vel ~= nil and SilentAim.Vel.Vel ~= nil then
+		pcall(function() velM = SilentAim.Vel.Vel.Magnitude end)
+	end
+	if SilentAim.PredictedPos ~= nil then
+		pcall(function()
+			local p = SilentAim.PredictedPos
+			predPos = string.format("%.1f,%.1f,%.1f", p.X, p.Y, p.Z)
+		end)
+	end
+	local aimOrg, aimTgt, aimDir = nil, nil, nil
+	pcall(function()
+		local o = Universery.SilentFire.GetOrigin()
+		if o == nil and SilentAim.HookOrigin ~= nil then
+			o = SilentAim.HookOrigin
+		end
+		if o ~= nil and SilentAim.PredictedPos ~= nil then
+			local t = SilentAim.PredictedPos
+			local d = t - o
+			local m = d.Magnitude
+			aimOrg = string.format("%.1f,%.1f,%.1f", o.X, o.Y, o.Z)
+			aimTgt = string.format("%.1f,%.1f,%.1f", t.X, t.Y, t.Z)
+			if m > 0.001 then
+				local u = d / m
+				aimDir = string.format("%.3f,%.3f,%.3f", u.X, u.Y, u.Z)
+			end
+		end
+	end)
 	return {
 		Enabled = S.Enabled,
 		KeyHeld = keyHeld,
@@ -7958,7 +8368,16 @@ Environment.GetSilentInfo = LPH_NO_VIRTUALIZE(function()
 		HookHits = Fire2.Hits(),
 		Hooked = Fire2.IsHooked(),
 		Aimwork = awState,
+		AWDiag = awDiag,
+		AWDiag = awDiag,
 		Source = SilentAim.Dbg.Source or "-",
+		EffLatency = effT,
+		VelMag = velM,
+		Predicted = predPos,
+		AimOrigin = aimOrg,
+		AimTarget = aimTgt,
+		AimDirection = aimDir,
+		Firing = SilentAim.FireHeld and true or false,
 		Tool = tool,
 		VisualCamera = "Unchanged",
 		FOV = S.FOV,
@@ -9546,6 +9965,7 @@ if DbgSec ~= nil then
 	El.DbgFOV = DbgSec:Label({ Text = "Prediction: -" })
 	El.SilentDbg = DbgSec:Label({ Text = "Silent: OFF" })
 	El.SilentDbg2 = DbgSec:Label({ Text = "Fire: -" })
+	El.SilentDbg3 = DbgSec:Label({ Text = "Checks: -" })
 
 	El.AimbotDebugger = DbgSec:Toggle({
 		Name = "Aimbot Print Debugger",
@@ -9621,6 +10041,16 @@ task.spawn(function()
 				.. " | Hits: " .. tostring(sinfo.HookHits or 0)
 				.. " | AW: " .. tostring(sinfo.Aimwork or "?")
 				.. " | Cam: UNCHANGED")
+			local awd = sinfo.AWDiag
+			if type(awd) ~= "table" then
+				awd = {}
+			end
+			SetLabel(El.SilentDbg3, "AW src/class/inst/trk/iter: "
+				.. tostring(awd.source) .. "/" .. tostring(awd.class) .. "/"
+				.. tostring(awd.instance) .. "/" .. tostring(awd.tracker) .. "/"
+				.. tostring(awd.iterate) .. " | Sel: " .. tostring(awd.selected)
+				.. " | Pred: " .. tostring(sinfo.Predicted or "-")
+				.. " | Dir: " .. tostring(sinfo.AimDirection or "-"))
 		end
 	end
 end)

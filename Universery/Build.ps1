@@ -12,7 +12,10 @@ $Modules = @(
     @{ Name = "gen/aimwork_blobs"; Path = "src/gen/aimwork_blobs.luau" },
     @{ Name = "Libraries/Aimwork/loader"; Path = "Libraries/Aimwork/loader.luau" },
     @{ Name = "Features/SilentAim/AimworkAdapter"; Path = "Features/SilentAim/AimworkAdapter.lua" },
+    @{ Name = "Features/SilentAim/Adapters/Generic"; Path = "Features/SilentAim/Adapters/Generic.lua" },
+    @{ Name = "Features/SilentAim/Adapters/Registry"; Path = "Features/SilentAim/Adapters/Registry.lua" },
     @{ Name = "Features/SilentAim/FireAdapter"; Path = "Features/SilentAim/FireAdapter.lua" },
+    @{ Name = "Features/SilentAim/FireState"; Path = "Features/SilentAim/FireState.lua" },
     @{ Name = "Shared/TeamResolver"; Path = "Shared/TeamResolver.lua" }
 )
 

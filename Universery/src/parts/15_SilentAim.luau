@@ -193,7 +193,7 @@ function SilentAim.Validate(player, S, cam, camPos, viewport, origin, overPos, o
 	if overPos ~= nil then
 		partPos, partName = overPos, overName or (S.TargetPart or "Head")
 	else
-		partPos, partName = SilentAim.ResolvePart(Character, S.TargetPart or "Head", origin, cam)
+		partPos, partName = SilentAim.ResolvePart(Character, player, S.TargetPart or "Head", origin, cam)
 	end
 	if partPos == nil then
 		return bad
@@ -269,8 +269,10 @@ function SilentAim.UpdateOrientation()
 		return
 	end
 	local cam = workspace.CurrentCamera or Camera
-	local origin = nil
-	pcall(function() origin = cam.CFrame.Position end)
+	local origin = Universery.SilentFire.GetOrigin()
+	if origin == nil then
+		pcall(function() origin = cam.CFrame.Position end)
+	end
 	if origin == nil then
 		SilentAim.AimCFrame = nil
 		return
@@ -497,12 +499,10 @@ function SilentAim.Frame(dt)
 		Fire.Uninstall()
 	end
 	pcall(function() Fire.SetCamera(workspace.CurrentCamera or Camera) end)
-	local okMB, mb = pcall(function() return __index(UserInputService, "IsMouseButtonPressed")(UserInputService, Enum.UserInputType.MouseButton1) end)
-	SilentAim.FireHeld = (okMB and mb) and true or false
-	if SilentAim.FireHeld and not SilentAim.PrevFireHeld then
-		SilentAim.LastFireEvent = tick()
-	end
-	SilentAim.PrevFireHeld = SilentAim.FireHeld
+	local FS = Universery.FireState
+	FS.Poll()
+	FS.RefreshTools()
+	SilentAim.FireHeld = FS.IsFiring()
 	SilentAim.ScanAccum = SilentAim.ScanAccum + (dt or 0.016)
 	if SilentAim.ScanAccum >= (1 / 45) then
 		SilentAim.ScanAccum = 0
@@ -512,7 +512,7 @@ function SilentAim.Frame(dt)
 			SilentAim.Clear()
 		end
 	end
-	local firing = SilentAim.FireHeld or (tick() - (SilentAim.LastFireEvent or 0)) < 0.15
+	local firing = FS.IsFiring()
 	local armed = SilentAim.IsArmed()
 	Fire.SetAim(SilentAim.PredictedPos, SilentAim.AimCFrame, SilentAim.HookOrigin)
 	Fire.SetOverride(Fire.IsHooked() and armed and SilentAim.Target ~= nil and SilentAim.PredictedPos ~= nil and firing)
@@ -559,6 +559,7 @@ function SilentAim.Shutdown()
 	if Universery.AimworkAdapter ~= nil then
 		pcall(Universery.AimworkAdapter.Teardown)
 	end
+	Universery.FireState.Reset()
 	if SilentAim.FOVCircle ~= nil then
 		pcall(function() SilentAim.FOVCircle:Remove() end)
 		SilentAim.FOVCircle = nil
@@ -610,12 +611,65 @@ Environment.GetSilentInfo = LPH_NO_VIRTUALIZE(function()
 			awState = tostring(stAW)
 		end
 	end
+	local awDiag = nil
+	if Universery.AimworkAdapter ~= nil then
+		pcall(function()
+			local d = Universery.AimworkAdapter.Diag()
+			if type(d) == "table" then
+				awDiag = d
+			end
+		end)
+	end
 	local pipe = "NOT CONNECTED"
 	if hasApplier or regAdapter ~= nil then
 		pipe = "CUSTOM"
 	elseif Fire2.IsHooked() then
 		pipe = "HOOKED"
 	end
+	local awDiag = { source = false, class = false, instance = false, tracker = false, iterate = false, selected = "NONE" }
+	if Universery.AimworkAdapter ~= nil then
+		pcall(function()
+			local d = Universery.AimworkAdapter.Diag()
+			if type(d) == "table" then
+				awDiag = d
+			end
+		end)
+	end
+	local effT, velM, predPos = 0, 0, nil
+	if S.Prediction then
+		if PingState.Available and (PingState.Effective or 0) > 0 then
+			effT = PingState.Effective
+		else
+			effT = 0.1
+		end
+	end
+	if SilentAim.Vel ~= nil and SilentAim.Vel.Vel ~= nil then
+		pcall(function() velM = SilentAim.Vel.Vel.Magnitude end)
+	end
+	if SilentAim.PredictedPos ~= nil then
+		pcall(function()
+			local p = SilentAim.PredictedPos
+			predPos = string.format("%.1f,%.1f,%.1f", p.X, p.Y, p.Z)
+		end)
+	end
+	local aimOrg, aimTgt, aimDir = nil, nil, nil
+	pcall(function()
+		local o = Universery.SilentFire.GetOrigin()
+		if o == nil and SilentAim.HookOrigin ~= nil then
+			o = SilentAim.HookOrigin
+		end
+		if o ~= nil and SilentAim.PredictedPos ~= nil then
+			local t = SilentAim.PredictedPos
+			local d = t - o
+			local m = d.Magnitude
+			aimOrg = string.format("%.1f,%.1f,%.1f", o.X, o.Y, o.Z)
+			aimTgt = string.format("%.1f,%.1f,%.1f", t.X, t.Y, t.Z)
+			if m > 0.001 then
+				local u = d / m
+				aimDir = string.format("%.3f,%.3f,%.3f", u.X, u.Y, u.Z)
+			end
+		end
+	end)
 	return {
 		Enabled = S.Enabled,
 		KeyHeld = keyHeld,
@@ -632,7 +686,16 @@ Environment.GetSilentInfo = LPH_NO_VIRTUALIZE(function()
 		HookHits = Fire2.Hits(),
 		Hooked = Fire2.IsHooked(),
 		Aimwork = awState,
+		AWDiag = awDiag,
+		AWDiag = awDiag,
 		Source = SilentAim.Dbg.Source or "-",
+		EffLatency = effT,
+		VelMag = velM,
+		Predicted = predPos,
+		AimOrigin = aimOrg,
+		AimTarget = aimTgt,
+		AimDirection = aimDir,
+		Firing = SilentAim.FireHeld and true or false,
 		Tool = tool,
 		VisualCamera = "Unchanged",
 		FOV = S.FOV,

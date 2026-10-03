@@ -17,6 +17,7 @@ A._instance = nil
 A._state = "NOT INSTALLED"
 A._detail = "Libraries/Aimwork source not present"
 A._cooldownUntil = 0
+A._diag = { source = false, class = false, instance = false, tracker = false, iterate = false, selected = "NONE" }
 
 local fovOrigin = nil
 local fovRadius = 150
@@ -51,6 +52,19 @@ function A.IsReady()
 	return A._state == "READY" and A._instance ~= nil
 end
 
+function A.Diag()
+	return {
+		source = A._diag.source,
+		class = A._diag.class,
+		instance = A._diag.instance,
+		tracker = A._diag.tracker,
+		iterate = A._diag.iterate,
+		selected = A._diag.selected,
+		state = A._state,
+		detail = A._detail,
+	}
+end
+
 function A.State()
 	return A._state, A._detail
 end
@@ -67,10 +81,9 @@ function A.BuildConfig(S)
 	if S ~= nil and S.IncludeDeadTargets then
 		dead = false
 	end
-	local wall = false
-	if S ~= nil and S.VisibilityCheck then
-		wall = "Full"
-	end
+	-- Visibility is decided SOLELY by Universery post-validation (cached raycasts).
+	-- Aimwork keeps only the cheap on-screen gate so both systems agree.
+	local wall = "OnScreen"
 	local pfType, pfName = "Blocklist", {}
 	local mode = S ~= nil and S.TargetPart or "Head"
 	if mode == "Head" or mode == "HumanoidRootPart" or mode == "UpperTorso" or mode == "LowerTorso" then
@@ -132,6 +145,7 @@ function A.Ensure(S)
 		A._cooldownUntil = tick() + 5
 		return false
 	end
+	A._diag.source = Universery.AimworkSources ~= nil
 	local okC, class = pcall(function() return loader.Load("aimwork") end)
 	if not okC or type(class) ~= "table" or type(class.new) ~= "function" then
 		A._state = "NOT COMPATIBLE"
@@ -140,6 +154,7 @@ function A.Ensure(S)
 		return false
 	end
 	A._class = class
+	A._diag.class = true
 	local okN, inst = pcall(function() return class.new(A.BuildConfig(S)) end)
 	if not okN or inst == nil then
 		A._state = "ERROR"
@@ -148,6 +163,17 @@ function A.Ensure(S)
 		return false
 	end
 	A._instance = inst
+	local hasTracker = false
+	pcall(function()
+		hasTracker = inst.checks ~= nil and inst.checks.playerTracker ~= nil
+	end)
+	A._diag.tracker = hasTracker and true or false
+	if not hasTracker then
+		A._state = "ERROR"
+		A._detail = "player tracker missing"
+		A._cooldownUntil = tick() + 5
+		return false
+	end
 	local okR = pcall(function() return inst:RegisterCustomFov(headless) end)
 	if not okR then
 		pcall(function()
@@ -164,6 +190,7 @@ function A.Update()
 		return false
 	end
 	local ok = pcall(function() return A._instance:Iterate() end)
+	A._diag.iterate = ok and true or false
 	return ok
 end
 
@@ -195,8 +222,12 @@ function A.GetTarget()
 	pcall(function() pname = pt.Name end)
 	pcall(function() sdist = sel.distance end)
 	if pos == nil then
+		A._diag.selected = "NONE"
 		return nil
 	end
+	local nm = nil
+	pcall(function() nm = pl.Name end)
+	A._diag.selected = nm or "?"
 	return { Player = pl, Part = pt, PartName = pname, Position = pos, Distance = sdist }
 end
 
@@ -205,6 +236,8 @@ function A.Teardown()
 		pcall(function() return A._instance:Destroy() end)
 		A._instance = nil
 	end
+	A._diag.selected = "NONE"
+	A._diag.iterate = false
 	if A._state == "READY" then
 		A._state = "BOUND"
 		A._detail = "stopped"
