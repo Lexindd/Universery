@@ -2,6 +2,7 @@
 -- Consumes Universery.AimworkSources (generated). Exposes Universery.AimworkLoad klass.
 -- Rules honored: upstream files verbatim (blobs), no fork, graceful degrade.
 
+local Universery = Require("registry")
 Universery.AimworkLoad = Universery.AimworkLoad or {}
 local L = Universery.AimworkLoad
 L._cache = L._cache or {}
@@ -75,3 +76,5 @@ function L.Reset()
 	L._cache = {}
 	L._loading = {}
 end
+
+return Universery.AimworkLoad

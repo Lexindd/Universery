@@ -8,6 +8,7 @@
 --   SetAim(pos, cf, org) SetCamera(cam) SetOverride(on) IsOverriding()
 --   Hits() Info() RegisterAdapter(gameId, adapter) ApplyCustom(pos, cf)
 
+local Universery = Require("registry")
 Universery.SilentFire = Universery.SilentFire or {}
 local F = Universery.SilentFire
 
@@ -215,3 +216,5 @@ function F.ApplyCustom(pos, cf)
 	end
 	return false
 end
+
+return Universery.SilentFire

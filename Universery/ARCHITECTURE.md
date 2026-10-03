@@ -87,7 +87,9 @@ file itself is the current entry). `UniversalToolkit/` is out of scope.
 
 ## 4. Module conventions (binding)
 
-1. One file = one `do ... end` scope at bundle time (register hygiene).
+1. Every module file becomes a factory: `__Modules["name"] = function(Require) ... end`
+   (emitted by Build.ps1 v3). Inter-module sharing ONLY via `Require("registry")`
+   (the single shared table); no chunk-locals cross factory boundaries.
 2. Sharing ONLY via `Universery.*` registry (one chunk local, declared first).
    No cross-module `local` visibility, no `_G/getgenv` feature state.
 3. Modules: `Universery.X = {}` + `function Universery.X.F()` + `Init/Start/
@@ -134,8 +136,11 @@ replaced by Build.ps1 (aimbot.txt is DIVERGED - do not rebuild from it).
 
 ## 8. M2a status (registry seed + first extractions)
 
-- `local Universery = {}` registry first in dist; new modules wrapped in
-  `do/end` by Build.ps1 v2 (manifest: registry + 4 modules + 10 raw parts).
+- `local Universery` exists exactly twice in dist: once inside the registry
+  factory (the table itself) and once as the chunk-level boot line
+  (`local Universery = Require("registry")`) placed after all factory defs,
+  before parts. Verified by validate_dist.py (11 checks) + lupa runtime
+  harness (bootstrap, sharing, caching, graceful failures).
 - Extracted: `Features/SilentAim/FireAdapter.lua` (hook engine, own registry),
   live `AimworkAdapter` + `Libraries/Aimwork/loader.luau` + generated blobs.
 - Monolith rewired to `Universery.*` (~25 call sites, no logic changes).

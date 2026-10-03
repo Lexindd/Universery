@@ -8,6 +8,7 @@
 -- Team filtering is INTENTIONALLY left to Universery post-validation
 -- (Aimwork only sees native teams; custom games would wipe out everyone).
 
+local Universery = Require("registry")
 Universery.AimworkAdapter = Universery.AimworkAdapter or {}
 local A = Universery.AimworkAdapter
 
@@ -209,3 +210,5 @@ function A.Teardown()
 		A._detail = "stopped"
 	end
 end
+
+return Universery.AimworkAdapter

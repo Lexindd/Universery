@@ -5,6 +5,7 @@
 --   GetService, GetPlayers, Players, LocalPlayer, Connect, Tick, Env})
 -- must run once at boot before any other TR.* call.
 
+local Universery = Require("registry")
 Universery.TeamResolver = Universery.TeamResolver or {}
 local TR = Universery.TeamResolver
 local D = {}
@@ -717,3 +718,5 @@ end
 function TR.FriendAPIOk()
 	return not FriendAPIUnavailable
 end
+
+return Universery.TeamResolver

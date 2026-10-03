@@ -1,7 +1,8 @@
--- 00_registry: the single shared table. FIRST in dist, before everything.
--- Inter-module sharing goes ONLY through Universery.* fields.
--- Module files must not create chunk-level locals for shared state.
+-- registry: the single shared Universery table.
+-- Loaded first; every other module receives it via Require("registry").
 
 local Universery = {
-	Version = "2-a",
+	Version = "2-b",
 }
+
+return Universery
