@@ -73,16 +73,20 @@ task.spawn(function()
 		end
 		local okS, sinfo = pcall(function() return A.GetSilentInfo() end)
 		if okS and type(sinfo) == "table" then
-			SetLabel(El.SilentDbg, "Silent: " .. tostring(sinfo.AimMethod or "-")
+			SetLabel(El.SilentDbg, "Silent: " .. ((sinfo.Enabled and "ON") or "OFF")
+				.. " | Key: " .. ((sinfo.KeyHeld and "YES") or "NO")
 				.. " | Tgt " .. tostring(sinfo.Target or "None")
-				.. " " .. tostring(sinfo.Part or "-")
-				.. " " .. string.format("%.0f", sinfo.ScreenDist or -1)
-				.. " [" .. tostring(sinfo.Source or "?") .. "]")
-			SetLabel(El.SilentDbg2, "Fire: " .. tostring(sinfo.FirePipeline or "?")
-				.. " | Override: " .. tostring(sinfo.Override or "?")
-				.. " | Hits: " .. tostring(sinfo.HookHits or 0)
-				.. " | AW: " .. tostring(sinfo.Aimwork or "?")
-				.. " | Cam: UNCHANGED")
+				.. " " .. tostring(sinfo.Part or "-"))
+			local scrXY = "-"
+			if sinfo.Target ~= nil then
+				scrXY = string.format("%.0f,%.0f", sinfo.ScreenX or -1, sinfo.ScreenY or -1)
+			end
+			SetLabel(El.SilentDbg2, "FOV " .. tostring(sinfo.FOVOrigin or "?")
+				.. " | Mouse " .. tostring(sinfo.MouseX or -1) .. "," .. tostring(sinfo.MouseY or -1)
+				.. " | R " .. tostring(sinfo.FOV or 0)
+				.. " | Scr " .. scrXY
+				.. " | MouseDist " .. string.format("%.0f", sinfo.MouseDist or -1)
+				.. " | InFOV: " .. ((sinfo.InFOV and "YES") or "NO"))
 			local awd = sinfo.AWDiag
 			if type(awd) ~= "table" then
 				awd = {}
@@ -92,7 +96,13 @@ task.spawn(function()
 				.. tostring(awd.instance) .. "/" .. tostring(awd.tracker) .. "/"
 				.. tostring(awd.iterate) .. " | Sel: " .. tostring(awd.selected)
 				.. " | Pred: " .. tostring(sinfo.Predicted or "-")
-				.. " | Dir: " .. tostring(sinfo.AimDirection or "-"))
+				.. " | Dir: " .. tostring(sinfo.AimDirection or "-")
+				.. " | Behind: " .. tostring(sinfo.Behind or 0)
+				.. " | Fire: " .. tostring(sinfo.FirePipeline or "?")
+				.. " | Override: " .. tostring(sinfo.Override or "?")
+				.. " | Apps: " .. tostring(sinfo.OverrideApps or 0)
+				.. " | Ev: " .. tostring(sinfo.FireEvents or 0)
+				.. " | Cam: UNCHANGED")
 		end
 	end
 end)

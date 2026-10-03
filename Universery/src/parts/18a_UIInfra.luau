@@ -140,6 +140,9 @@ local function Write(path, value)
 		elseif path == "SilentAim.FOVTransparency" then A.SilentAim.FOVTransparency = value
 		elseif path == "SilentAim.FOVFilled" then A.SilentAim.FOVFilled = value
 		elseif path == "SilentAim.FOVFillTransparency" then A.SilentAim.FOVFillTransparency = value
+		elseif path == "SilentAim.FOVOutline" then A.SilentAim.FOVOutline = value
+		elseif path == "SilentAim.FOVOutlineColor" then A.SilentAim.FOVOutlineColor = value
+		elseif path == "SilentAim.FOVOutlineThickness" then A.SilentAim.FOVOutlineThickness = value
 		elseif path == "SilentAim.FOVOrigin" then A.SilentAim.FOVOrigin = value
 		elseif path == "SilentAim.TargetPart" then A.SilentAim.TargetPart = value
 		elseif path == "SilentAim.AimMode" then A.SilentAim.AimMode = value

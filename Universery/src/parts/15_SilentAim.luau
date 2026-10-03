@@ -12,7 +12,7 @@ local SilentAim = {
 	KeyHeld = false, KeyToggle = false,
 	ScanAccum = 0, LostAt = 0,
 	Vel = nil, RandomFor = nil, RandomPick = nil,
-	FOVCircle = nil,
+	FOVCircle = nil, FOVCircleOutline = nil,
 	CustomOn = false,
 	FireHeld = false, LastFireEvent = 0,
 	Dbg = { ScreenDist = -1, Visible = false, Team = "-", Part = "-", Source = "-" },
@@ -202,8 +202,9 @@ function SilentAim.Validate(player, S, cam, camPos, viewport, origin, overPos, o
 	if worldDist > (S.MaxDistance or 1000) then
 		return bad
 	end
-	local scr, _, onScreen = ESPProject(cam, partPos)
-	if scr == nil or not onScreen then
+	local scr, depth = ESPProject(cam, partPos)
+	if scr == nil or depth == nil or depth <= 0 then
+		SilentAim.BehindCount = (SilentAim.BehindCount or 0) + 1
 		return bad
 	end
 	local fovDist = (Vector2.new(scr.X, scr.Y) - origin).Magnitude
@@ -218,11 +219,10 @@ function SilentAim.Validate(player, S, cam, camPos, viewport, origin, overPos, o
 			return bad
 		end
 	end
-	local centerDist = (Vector2.new(scr.X, scr.Y) - Vector2.new(viewport.X / 2, viewport.Y / 2)).Magnitude
 	return {
 		valid = true, Player = player, Character = Character, Humanoid = Humanoid,
 		Part = partName, PartPos = partPos, Screen = scr, CamPos = camPos,
-		WorldDist = worldDist, FovDist = fovDist, CenterDist = centerDist, Visible = visible,
+		WorldDist = worldDist, FovDist = fovDist, Visible = visible,
 	}
 end
 
@@ -335,7 +335,7 @@ function SilentAim.Commit(st, source)
 	if okT and type(ti) == "table" and ti.TeamName ~= nil then
 		teamName = tostring(ti.TeamName)
 	end
-	SilentAim.Dbg = { ScreenDist = st.FovDist, Visible = st.Visible, Team = teamName, Part = st.Part, Source = source or "BuiltIn" }
+	SilentAim.Dbg = { ScreenDist = st.FovDist, Visible = st.Visible, Team = teamName, Part = st.Part, Source = source or "BuiltIn", ScreenX = st.Screen.X, ScreenY = st.Screen.Y }
 end
 
 function SilentAim.ConsultAimwork(S, origin)
@@ -375,6 +375,7 @@ function SilentAim.Scan()
 	end
 	local camPos = camCF.Position
 	local origin = SilentAim.OriginPos(viewport)
+	SilentAim.BehindCount = 0
 	if S.StickyTarget and SilentAim.Target ~= nil then
 		local st = SilentAim.Validate(SilentAim.Target, S, cam, camPos, viewport, origin)
 		if st.valid then
@@ -399,7 +400,7 @@ function SilentAim.Scan()
 			return
 		end
 	end
-	local mode = S.AimMode or "Closest To Crosshair"
+	local mode = S.AimMode or "Closest To Mouse"
 	local best, bestScore = nil, nil
 	local plist = SilentAim.PlayersCache
 	if plist == nil or (tick() - (SilentAim.PlayersCacheT or 0)) > 1 then
@@ -415,8 +416,6 @@ function SilentAim.Scan()
 				local score = st.FovDist
 				if mode == "Closest Distance" then
 					score = st.WorldDist
-				elseif mode == "Lowest Screen Distance" then
-					score = st.CenterDist
 				end
 				if bestScore == nil or score < bestScore then
 					best, bestScore = st, score
@@ -438,32 +437,43 @@ function SilentAim.DrawFOV()
 	if SilentAim.FOVCircle == nil then
 		SilentAim.FOVCircle = ESPMk("Circle")
 	end
+	if SilentAim.FOVCircleOutline == nil then
+		SilentAim.FOVCircleOutline = ESPMk("Circle")
+	end
 	local c = SilentAim.FOVCircle
+	local oc = SilentAim.FOVCircleOutline
 	if c == nil then
+		if oc ~= nil then
+			oc.Visible = false
+		end
 		return
 	end
 	if S == nil or not S.Enabled or not S.ShowFOV then
 		c.Visible = false
+		if oc ~= nil then
+			oc.Visible = false
+		end
 		return
 	end
-	local ox, oy = 0, 0
-	local okC, camNow = pcall(function() return workspace.CurrentCamera or Camera end)
-	if okC and camNow ~= nil then
-		local okV, vs = pcall(function() return camNow.ViewportSize end)
-		if okV and vs ~= nil then
-			ox, oy = vs.X / 2, vs.Y / 2
+	local viewport = Vector2.new(0, 0)
+	pcall(function()
+		local camNow = workspace.CurrentCamera or Camera
+		if camNow ~= nil then
+			local vs = camNow.ViewportSize
+			if vs ~= nil then
+				viewport = Vector2.new(vs.X, vs.Y)
+			end
 		end
-	end
-	if S.FOVOrigin == "Mouse" then
-		local okM, mp = pcall(function() return GetMouseLocation(UserInputService) end)
-		if okM and mp ~= nil then
-			ox, oy = mp.X, mp.Y
-		end
-	end
-	c.Position = Vector2.new(ox, oy)
-	c.Radius = S.FOV or 150
+	end)
+	local o = SilentAim.OriginPos(viewport)
+	local radius = S.FOV or 150
+	local thick = S.FOVThickness or 1
+	local pad = S.FOVOutlineThickness or 2
+	c.Position = o
+	c.Radius = radius
 	c.Color = S.FOVColor or Color3fromRGB(255, 255, 255)
-	c.Thickness = S.FOVThickness or 1
+	c.Thickness = thick
+	c.ZIndex = 1
 	if S.FOVFilled then
 		c.Filled = true
 		c.Transparency = S.FOVFillTransparency or 0.5
@@ -472,6 +482,18 @@ function SilentAim.DrawFOV()
 		c.Transparency = S.FOVTransparency or 0
 	end
 	c.Visible = true
+	if oc ~= nil and S.FOVOutline then
+		oc.Position = o
+		oc.Radius = radius + pad
+		oc.Color = S.FOVOutlineColor or Color3fromRGB(0, 0, 0)
+		oc.Thickness = thick + 2
+		oc.Filled = false
+		oc.Transparency = S.FOVTransparency or 0
+		oc.ZIndex = 0
+		oc.Visible = true
+	elseif oc ~= nil then
+		oc.Visible = false
+	end
 end
 
 function SilentAim.Frame(dt)
@@ -516,6 +538,10 @@ function SilentAim.Frame(dt)
 	local armed = SilentAim.IsArmed()
 	Fire.SetAim(SilentAim.PredictedPos, SilentAim.AimCFrame, SilentAim.HookOrigin)
 	Fire.SetOverride(Fire.IsHooked() and armed and SilentAim.Target ~= nil and SilentAim.PredictedPos ~= nil and firing)
+	if Fire.IsOverriding() and not SilentAim.PrevOverride then
+		SilentAim.OverrideApps = (SilentAim.OverrideApps or 0) + 1
+	end
+	SilentAim.PrevOverride = Fire.IsOverriding()
 	local customOn = SilentAim.CustomOn and SilentAim.Target ~= nil
 	if not armed then
 		SilentAim.Method = "Idle"
@@ -526,7 +552,7 @@ function SilentAim.Frame(dt)
 			SilentAim.SupportReason = "Custom aim applier engaged; visual camera unchanged"
 		else
 			SilentAim.Method = "Active (Hook)"
-			SilentAim.SupportReason = "Camera reads redirected to target; visual unchanged | hits=" .. tostring(Fire.Hits())
+			SilentAim.SupportReason = "Camera reads redirected to target; visual unchanged | hookreads=" .. tostring(Fire.HookReads())
 		end
 	elseif SilentAim.Target == nil then
 		SilentAim.Method = "Idle"
@@ -563,6 +589,10 @@ function SilentAim.Shutdown()
 	if SilentAim.FOVCircle ~= nil then
 		pcall(function() SilentAim.FOVCircle:Remove() end)
 		SilentAim.FOVCircle = nil
+	end
+	if SilentAim.FOVCircleOutline ~= nil then
+		pcall(function() SilentAim.FOVCircleOutline:Remove() end)
+		SilentAim.FOVCircleOutline = nil
 	end
 end
 
@@ -670,12 +700,38 @@ Environment.GetSilentInfo = LPH_NO_VIRTUALIZE(function()
 			end
 		end
 	end)
+	local mx, my = -1, -1
+	pcall(function()
+		local mp = GetMouseLocation(UserInputService)
+		if mp ~= nil then
+			mx, my = mp.X, mp.Y
+		end
+	end)
+	local mouseDist = SilentAim.Dbg.ScreenDist or -1
+	local inFov = false
+	if SilentAim.Target ~= nil and mouseDist >= 0 and mouseDist <= (S.FOV or 150) then
+		inFov = true
+	end
+	local fireEvents, toolEvents = 0, 0
+	if Universery.FireState ~= nil then
+		pcall(function() fireEvents = Universery.FireState.FireEvents() end)
+		pcall(function() toolEvents = Universery.FireState.ToolEvents() end)
+	end
+	local mreads = { Hit = 0, Target = 0, UnitRay = 0 }
+	pcall(function()
+		local r = Fire2.Info().reads
+		if type(r) == "table" then
+			mreads = r
+		end
+	end)
 	return {
 		Enabled = S.Enabled,
 		KeyHeld = keyHeld,
 		Target = tname,
 		Part = SilentAim.TargetPart or "-",
 		ScreenDist = SilentAim.Dbg.ScreenDist or -1,
+		ScreenX = SilentAim.Dbg.ScreenX or -1,
+		ScreenY = SilentAim.Dbg.ScreenY or -1,
 		Visible = SilentAim.Dbg.Visible,
 		Team = SilentAim.Dbg.Team or "-",
 		Prediction = S.Prediction,
@@ -683,10 +739,9 @@ Environment.GetSilentInfo = LPH_NO_VIRTUALIZE(function()
 		Reason = SilentAim.SupportReason,
 		FirePipeline = pipe,
 		Override = (Fire2.IsOverriding() and "ACTIVE" or "INACTIVE"),
-		HookHits = Fire2.Hits(),
+		HookReads = Fire2.HookReads(),
 		Hooked = Fire2.IsHooked(),
 		Aimwork = awState,
-		AWDiag = awDiag,
 		AWDiag = awDiag,
 		Source = SilentAim.Dbg.Source or "-",
 		EffLatency = effT,
@@ -696,6 +751,18 @@ Environment.GetSilentInfo = LPH_NO_VIRTUALIZE(function()
 		AimTarget = aimTgt,
 		AimDirection = aimDir,
 		Firing = SilentAim.FireHeld and true or false,
+		FOVOrigin = S.FOVOrigin or "?",
+		MouseX = mx,
+		MouseY = my,
+		MouseDist = mouseDist,
+		InFOV = inFov,
+		Behind = SilentAim.BehindCount or 0,
+		OverrideApps = SilentAim.OverrideApps or 0,
+		Behind = SilentAim.BehindCount or 0,
+		FireEvents = fireEvents,
+		ToolEvents = toolEvents,
+		OverrideApps = SilentAim.OverrideApps or 0,
+		MouseReads = mreads,
 		Tool = tool,
 		VisualCamera = "Unchanged",
 		FOV = S.FOV,

@@ -3105,7 +3105,7 @@ local F = Universery.SilentGeneric
 local LPH = LPH_NO_VIRTUALIZE or function(f) return f end
 
 F._hooked = false
-F._hits = 0
+F._hookreads = 0
 F._error = ""
 F._how = "none"
 F._cam = nil
@@ -3143,7 +3143,7 @@ function F.HookFn(self, key)
 		if key == "CFrame" then
 			local cf = F._cf
 			if cf ~= nil then
-				F._hits = F._hits + 1
+				F._hookreads = F._hookreads + 1
 				return cf
 			end
 		elseif key == "ScreenPointToRay" or key == "ViewportPointToRay" then
@@ -3151,7 +3151,7 @@ function F.HookFn(self, key)
 			local tgt = F._pos
 			local org = F._org
 			if tgt ~= nil and org ~= nil then
-				F._hits = F._hits + 1
+				F._hookreads = F._hookreads + 1
 				return function(_, x, y, depth)
 					local d = tgt - org
 					local m = d.Magnitude
@@ -3165,7 +3165,7 @@ function F.HookFn(self, key)
 		elseif key == "GetRenderCFrame" then
 			local cf = F._cf
 			if cf ~= nil then
-				F._hits = F._hits + 1
+				F._hookreads = F._hookreads + 1
 				return function() return cf end
 			end
 		end
@@ -3273,12 +3273,12 @@ function F.SetOverride(on)
 	F._override = (on == true)
 end
 
-function F.Hits()
-	return F._hits or 0
+function F.HookReads()
+	return F._hookreads or 0
 end
 
 function F.Info()
-	return { hooked = F._hooked, how = F._how, error = F._error, hits = F._hits or 0, reads = F.Reads() }
+	return { hooked = F._hooked, how = F._how, error = F._error, hookreads = F._hookreads or 0, reads = F.Reads() }
 end
 
 
@@ -3467,6 +3467,8 @@ FS._toolConns = {}
 FS._toolTime = 0
 FS._listeners = {}
 FS._caps = nil
+FS._mbEvents = 0
+FS._toolEvents = 0
 
 local function now()
 	local ok, t = pcall(function() return tick() end)
@@ -3504,8 +3506,10 @@ local function fireEvent(source)
 	local t = now()
 	if source == "mb" then
 		FS._mbTime = t
+		FS._mbEvents = (FS._mbEvents or 0) + 1
 	else
 		FS._toolTime = t
+		FS._toolEvents = (FS._toolEvents or 0) + 1
 	end
 	for _, fn in next, FS._listeners do
 		pcall(fn, source)
@@ -3607,6 +3611,14 @@ function FS.GetLastFireTime()
 		return a
 	end
 	return b
+end
+
+function FS.FireEvents()
+	return (FS._mbEvents or 0) + (FS._toolEvents or 0)
+end
+
+function FS.ToolEvents()
+	return FS._toolEvents or 0
 end
 
 function FS.OnFire(callback)
@@ -4982,15 +4994,18 @@ getgenv().ExunysDeveloperAimbot = {
 		EnabledKey = Enum.UserInputType.MouseButton2,
 		KeyMode = "Hold", -- Hold | Toggle
 		FOV = 150,
-		ShowFOV = false,
+		ShowFOV = true,
 		FOVColor = Color3.fromRGB(255, 255, 255),
 		FOVThickness = 1,
 		FOVTransparency = 0,
 		FOVFilled = false,
 		FOVFillTransparency = 0.5,
-		FOVOrigin = "Screen Center", -- Screen Center | Mouse
+		FOVOutline = true,
+		FOVOutlineColor = Color3.fromRGB(0, 0, 0),
+		FOVOutlineThickness = 2, -- outline radius padding + added line thickness
+		FOVOrigin = "Mouse", -- Mouse | Screen Center
 		TargetPart = "Head", -- Head | HumanoidRootPart | UpperTorso | LowerTorso | Random | Closest Part
-		AimMode = "Closest To Crosshair", -- Closest To Crosshair | Closest Distance | Lowest Screen Distance
+		AimMode = "Closest To Mouse", -- Closest To Mouse | Closest Distance
 		TeamCheck = true,
 		VisibilityCheck = false,
 		MaxDistance = 1000,
@@ -7694,7 +7709,7 @@ local SilentAim = {
 	KeyHeld = false, KeyToggle = false,
 	ScanAccum = 0, LostAt = 0,
 	Vel = nil, RandomFor = nil, RandomPick = nil,
-	FOVCircle = nil,
+	FOVCircle = nil, FOVCircleOutline = nil,
 	CustomOn = false,
 	FireHeld = false, LastFireEvent = 0,
 	Dbg = { ScreenDist = -1, Visible = false, Team = "-", Part = "-", Source = "-" },
@@ -7884,8 +7899,9 @@ function SilentAim.Validate(player, S, cam, camPos, viewport, origin, overPos, o
 	if worldDist > (S.MaxDistance or 1000) then
 		return bad
 	end
-	local scr, _, onScreen = ESPProject(cam, partPos)
-	if scr == nil or not onScreen then
+	local scr, depth = ESPProject(cam, partPos)
+	if scr == nil or depth == nil or depth <= 0 then
+		SilentAim.BehindCount = (SilentAim.BehindCount or 0) + 1
 		return bad
 	end
 	local fovDist = (Vector2.new(scr.X, scr.Y) - origin).Magnitude
@@ -7900,11 +7916,10 @@ function SilentAim.Validate(player, S, cam, camPos, viewport, origin, overPos, o
 			return bad
 		end
 	end
-	local centerDist = (Vector2.new(scr.X, scr.Y) - Vector2.new(viewport.X / 2, viewport.Y / 2)).Magnitude
 	return {
 		valid = true, Player = player, Character = Character, Humanoid = Humanoid,
 		Part = partName, PartPos = partPos, Screen = scr, CamPos = camPos,
-		WorldDist = worldDist, FovDist = fovDist, CenterDist = centerDist, Visible = visible,
+		WorldDist = worldDist, FovDist = fovDist, Visible = visible,
 	}
 end
 
@@ -8017,7 +8032,7 @@ function SilentAim.Commit(st, source)
 	if okT and type(ti) == "table" and ti.TeamName ~= nil then
 		teamName = tostring(ti.TeamName)
 	end
-	SilentAim.Dbg = { ScreenDist = st.FovDist, Visible = st.Visible, Team = teamName, Part = st.Part, Source = source or "BuiltIn" }
+	SilentAim.Dbg = { ScreenDist = st.FovDist, Visible = st.Visible, Team = teamName, Part = st.Part, Source = source or "BuiltIn", ScreenX = st.Screen.X, ScreenY = st.Screen.Y }
 end
 
 function SilentAim.ConsultAimwork(S, origin)
@@ -8057,6 +8072,7 @@ function SilentAim.Scan()
 	end
 	local camPos = camCF.Position
 	local origin = SilentAim.OriginPos(viewport)
+	SilentAim.BehindCount = 0
 	if S.StickyTarget and SilentAim.Target ~= nil then
 		local st = SilentAim.Validate(SilentAim.Target, S, cam, camPos, viewport, origin)
 		if st.valid then
@@ -8081,7 +8097,7 @@ function SilentAim.Scan()
 			return
 		end
 	end
-	local mode = S.AimMode or "Closest To Crosshair"
+	local mode = S.AimMode or "Closest To Mouse"
 	local best, bestScore = nil, nil
 	local plist = SilentAim.PlayersCache
 	if plist == nil or (tick() - (SilentAim.PlayersCacheT or 0)) > 1 then
@@ -8097,8 +8113,6 @@ function SilentAim.Scan()
 				local score = st.FovDist
 				if mode == "Closest Distance" then
 					score = st.WorldDist
-				elseif mode == "Lowest Screen Distance" then
-					score = st.CenterDist
 				end
 				if bestScore == nil or score < bestScore then
 					best, bestScore = st, score
@@ -8120,32 +8134,43 @@ function SilentAim.DrawFOV()
 	if SilentAim.FOVCircle == nil then
 		SilentAim.FOVCircle = ESPMk("Circle")
 	end
+	if SilentAim.FOVCircleOutline == nil then
+		SilentAim.FOVCircleOutline = ESPMk("Circle")
+	end
 	local c = SilentAim.FOVCircle
+	local oc = SilentAim.FOVCircleOutline
 	if c == nil then
+		if oc ~= nil then
+			oc.Visible = false
+		end
 		return
 	end
 	if S == nil or not S.Enabled or not S.ShowFOV then
 		c.Visible = false
+		if oc ~= nil then
+			oc.Visible = false
+		end
 		return
 	end
-	local ox, oy = 0, 0
-	local okC, camNow = pcall(function() return workspace.CurrentCamera or Camera end)
-	if okC and camNow ~= nil then
-		local okV, vs = pcall(function() return camNow.ViewportSize end)
-		if okV and vs ~= nil then
-			ox, oy = vs.X / 2, vs.Y / 2
+	local viewport = Vector2.new(0, 0)
+	pcall(function()
+		local camNow = workspace.CurrentCamera or Camera
+		if camNow ~= nil then
+			local vs = camNow.ViewportSize
+			if vs ~= nil then
+				viewport = Vector2.new(vs.X, vs.Y)
+			end
 		end
-	end
-	if S.FOVOrigin == "Mouse" then
-		local okM, mp = pcall(function() return GetMouseLocation(UserInputService) end)
-		if okM and mp ~= nil then
-			ox, oy = mp.X, mp.Y
-		end
-	end
-	c.Position = Vector2.new(ox, oy)
-	c.Radius = S.FOV or 150
+	end)
+	local o = SilentAim.OriginPos(viewport)
+	local radius = S.FOV or 150
+	local thick = S.FOVThickness or 1
+	local pad = S.FOVOutlineThickness or 2
+	c.Position = o
+	c.Radius = radius
 	c.Color = S.FOVColor or Color3fromRGB(255, 255, 255)
-	c.Thickness = S.FOVThickness or 1
+	c.Thickness = thick
+	c.ZIndex = 1
 	if S.FOVFilled then
 		c.Filled = true
 		c.Transparency = S.FOVFillTransparency or 0.5
@@ -8154,6 +8179,18 @@ function SilentAim.DrawFOV()
 		c.Transparency = S.FOVTransparency or 0
 	end
 	c.Visible = true
+	if oc ~= nil and S.FOVOutline then
+		oc.Position = o
+		oc.Radius = radius + pad
+		oc.Color = S.FOVOutlineColor or Color3fromRGB(0, 0, 0)
+		oc.Thickness = thick + 2
+		oc.Filled = false
+		oc.Transparency = S.FOVTransparency or 0
+		oc.ZIndex = 0
+		oc.Visible = true
+	elseif oc ~= nil then
+		oc.Visible = false
+	end
 end
 
 function SilentAim.Frame(dt)
@@ -8198,6 +8235,10 @@ function SilentAim.Frame(dt)
 	local armed = SilentAim.IsArmed()
 	Fire.SetAim(SilentAim.PredictedPos, SilentAim.AimCFrame, SilentAim.HookOrigin)
 	Fire.SetOverride(Fire.IsHooked() and armed and SilentAim.Target ~= nil and SilentAim.PredictedPos ~= nil and firing)
+	if Fire.IsOverriding() and not SilentAim.PrevOverride then
+		SilentAim.OverrideApps = (SilentAim.OverrideApps or 0) + 1
+	end
+	SilentAim.PrevOverride = Fire.IsOverriding()
 	local customOn = SilentAim.CustomOn and SilentAim.Target ~= nil
 	if not armed then
 		SilentAim.Method = "Idle"
@@ -8208,7 +8249,7 @@ function SilentAim.Frame(dt)
 			SilentAim.SupportReason = "Custom aim applier engaged; visual camera unchanged"
 		else
 			SilentAim.Method = "Active (Hook)"
-			SilentAim.SupportReason = "Camera reads redirected to target; visual unchanged | hits=" .. tostring(Fire.Hits())
+			SilentAim.SupportReason = "Camera reads redirected to target; visual unchanged | hookreads=" .. tostring(Fire.HookReads())
 		end
 	elseif SilentAim.Target == nil then
 		SilentAim.Method = "Idle"
@@ -8245,6 +8286,10 @@ function SilentAim.Shutdown()
 	if SilentAim.FOVCircle ~= nil then
 		pcall(function() SilentAim.FOVCircle:Remove() end)
 		SilentAim.FOVCircle = nil
+	end
+	if SilentAim.FOVCircleOutline ~= nil then
+		pcall(function() SilentAim.FOVCircleOutline:Remove() end)
+		SilentAim.FOVCircleOutline = nil
 	end
 end
 
@@ -8352,12 +8397,38 @@ Environment.GetSilentInfo = LPH_NO_VIRTUALIZE(function()
 			end
 		end
 	end)
+	local mx, my = -1, -1
+	pcall(function()
+		local mp = GetMouseLocation(UserInputService)
+		if mp ~= nil then
+			mx, my = mp.X, mp.Y
+		end
+	end)
+	local mouseDist = SilentAim.Dbg.ScreenDist or -1
+	local inFov = false
+	if SilentAim.Target ~= nil and mouseDist >= 0 and mouseDist <= (S.FOV or 150) then
+		inFov = true
+	end
+	local fireEvents, toolEvents = 0, 0
+	if Universery.FireState ~= nil then
+		pcall(function() fireEvents = Universery.FireState.FireEvents() end)
+		pcall(function() toolEvents = Universery.FireState.ToolEvents() end)
+	end
+	local mreads = { Hit = 0, Target = 0, UnitRay = 0 }
+	pcall(function()
+		local r = Fire2.Info().reads
+		if type(r) == "table" then
+			mreads = r
+		end
+	end)
 	return {
 		Enabled = S.Enabled,
 		KeyHeld = keyHeld,
 		Target = tname,
 		Part = SilentAim.TargetPart or "-",
 		ScreenDist = SilentAim.Dbg.ScreenDist or -1,
+		ScreenX = SilentAim.Dbg.ScreenX or -1,
+		ScreenY = SilentAim.Dbg.ScreenY or -1,
 		Visible = SilentAim.Dbg.Visible,
 		Team = SilentAim.Dbg.Team or "-",
 		Prediction = S.Prediction,
@@ -8365,10 +8436,9 @@ Environment.GetSilentInfo = LPH_NO_VIRTUALIZE(function()
 		Reason = SilentAim.SupportReason,
 		FirePipeline = pipe,
 		Override = (Fire2.IsOverriding() and "ACTIVE" or "INACTIVE"),
-		HookHits = Fire2.Hits(),
+		HookReads = Fire2.HookReads(),
 		Hooked = Fire2.IsHooked(),
 		Aimwork = awState,
-		AWDiag = awDiag,
 		AWDiag = awDiag,
 		Source = SilentAim.Dbg.Source or "-",
 		EffLatency = effT,
@@ -8378,6 +8448,18 @@ Environment.GetSilentInfo = LPH_NO_VIRTUALIZE(function()
 		AimTarget = aimTgt,
 		AimDirection = aimDir,
 		Firing = SilentAim.FireHeld and true or false,
+		FOVOrigin = S.FOVOrigin or "?",
+		MouseX = mx,
+		MouseY = my,
+		MouseDist = mouseDist,
+		InFOV = inFov,
+		Behind = SilentAim.BehindCount or 0,
+		OverrideApps = SilentAim.OverrideApps or 0,
+		Behind = SilentAim.BehindCount or 0,
+		FireEvents = fireEvents,
+		ToolEvents = toolEvents,
+		OverrideApps = SilentAim.OverrideApps or 0,
+		MouseReads = mreads,
 		Tool = tool,
 		VisualCamera = "Unchanged",
 		FOV = S.FOV,
@@ -8814,6 +8896,9 @@ local function Write(path, value)
 		elseif path == "SilentAim.FOVTransparency" then A.SilentAim.FOVTransparency = value
 		elseif path == "SilentAim.FOVFilled" then A.SilentAim.FOVFilled = value
 		elseif path == "SilentAim.FOVFillTransparency" then A.SilentAim.FOVFillTransparency = value
+		elseif path == "SilentAim.FOVOutline" then A.SilentAim.FOVOutline = value
+		elseif path == "SilentAim.FOVOutlineColor" then A.SilentAim.FOVOutlineColor = value
+		elseif path == "SilentAim.FOVOutlineThickness" then A.SilentAim.FOVOutlineThickness = value
 		elseif path == "SilentAim.FOVOrigin" then A.SilentAim.FOVOrigin = value
 		elseif path == "SilentAim.TargetPart" then A.SilentAim.TargetPart = value
 		elseif path == "SilentAim.AimMode" then A.SilentAim.AimMode = value
@@ -9869,15 +9954,18 @@ if SilentMain ~= nil then
 				A.SilentAim.EnabledKey = Enum.UserInputType.MouseButton2
 				A.SilentAim.KeyMode = "Hold"
 				A.SilentAim.FOV = 150
-				A.SilentAim.ShowFOV = false
+				A.SilentAim.ShowFOV = true
 				A.SilentAim.FOVColor = Color3.fromRGB(255, 255, 255)
 				A.SilentAim.FOVThickness = 1
 				A.SilentAim.FOVTransparency = 0
 				A.SilentAim.FOVFilled = false
 				A.SilentAim.FOVFillTransparency = 0.5
-				A.SilentAim.FOVOrigin = "Screen Center"
+				A.SilentAim.FOVOutline = true
+				A.SilentAim.FOVOutlineColor = Color3.fromRGB(0, 0, 0)
+				A.SilentAim.FOVOutlineThickness = 2
+				A.SilentAim.FOVOrigin = "Mouse"
 				A.SilentAim.TargetPart = "Head"
-				A.SilentAim.AimMode = "Closest To Crosshair"
+				A.SilentAim.AimMode = "Closest To Mouse"
 				A.SilentAim.TeamCheck = true
 				A.SilentAim.VisibilityCheck = false
 				A.SilentAim.MaxDistance = 1000
@@ -9895,15 +9983,18 @@ if SilentMain ~= nil then
 			if El.SA_Protect ~= nil then pcall(function() El.SA_Protect:UpdateState(false) end) end
 			if El.SA_Hook ~= nil then pcall(function() El.SA_Hook:UpdateState(true) end) end
 			if El.SA_FOV ~= nil then pcall(function() El.SA_FOV:UpdateValue(150) end) end
-			if El.SA_ShowFOV ~= nil then pcall(function() El.SA_ShowFOV:UpdateState(false) end) end
+			if El.SA_ShowFOV ~= nil then pcall(function() El.SA_ShowFOV:UpdateState(true) end) end
 			if El.SA_FOVColor ~= nil then pcall(function() El.SA_FOVColor:SetColor(Color3.fromRGB(255, 255, 255)) end) end
 			if El.SA_FOVThickness ~= nil then pcall(function() El.SA_FOVThickness:UpdateValue(1) end) end
 			if El.SA_FOVTransparency ~= nil then pcall(function() El.SA_FOVTransparency:UpdateValue(0) end) end
 			if El.SA_FOVFilled ~= nil then pcall(function() El.SA_FOVFilled:UpdateState(false) end) end
 			if El.SA_FOVFillTransparency ~= nil then pcall(function() El.SA_FOVFillTransparency:UpdateValue(0.5) end) end
-			if El.SA_FOVOrigin ~= nil then pcall(function() El.SA_FOVOrigin:UpdateSelection("Screen Center") end) end
+			if El.SA_FOVOutline ~= nil then pcall(function() El.SA_FOVOutline:UpdateState(true) end) end
+			if El.SA_FOVOutlineColor ~= nil then pcall(function() El.SA_FOVOutlineColor:SetColor(Color3.fromRGB(0, 0, 0)) end) end
+			if El.SA_FOVOutlineThickness ~= nil then pcall(function() El.SA_FOVOutlineThickness:UpdateValue(2) end) end
+			if El.SA_FOVOrigin ~= nil then pcall(function() El.SA_FOVOrigin:UpdateSelection("Mouse") end) end
 			if El.SA_TargetPart ~= nil then pcall(function() El.SA_TargetPart:UpdateSelection("Head") end) end
-			if El.SA_AimMode ~= nil then pcall(function() El.SA_AimMode:UpdateSelection("Closest To Crosshair") end) end
+			if El.SA_AimMode ~= nil then pcall(function() El.SA_AimMode:UpdateSelection("Closest To Mouse") end) end
 			if El.SA_Sticky ~= nil then pcall(function() El.SA_Sticky:UpdateState(true) end) end
 			if El.SA_SwitchDelay ~= nil then pcall(function() El.SA_SwitchDelay:UpdateValue(0.25) end) end
 			if El.SA_TeamCheck ~= nil then pcall(function() El.SA_TeamCheck:UpdateState(true) end) end
@@ -9920,15 +10011,18 @@ if SilentFOV ~= nil then
 	SilentFOV:Header({ Text = "FOV" })
 
 	espS(SilentFOV, "SA_FOV", "FOV Size", 150, 10, 1000, 0, "SilentAim.FOV")
-	espT(SilentFOV, "SA_ShowFOV", "Show FOV", false, "SilentAim.ShowFOV")
+	espT(SilentFOV, "SA_ShowFOV", "Show FOV", true, "SilentAim.ShowFOV")
 	espC(SilentFOV, "SA_FOVColor", "FOV Color", Color3.fromRGB(255, 255, 255), "SilentAim.FOVColor")
 	espS(SilentFOV, "SA_FOVThickness", "Thickness", 1, 1, 5, 0, "SilentAim.FOVThickness")
 	espS(SilentFOV, "SA_FOVTransparency", "Transparency", 0, 0, 1, 2, "SilentAim.FOVTransparency")
 	espT(SilentFOV, "SA_FOVFilled", "Filled", false, "SilentAim.FOVFilled")
 	espS(SilentFOV, "SA_FOVFillTransparency", "Fill Transparency", 0.5, 0, 1, 2, "SilentAim.FOVFillTransparency")
-	espD(SilentFOV, "SA_FOVOrigin", "FOV Origin", { "Screen Center", "Mouse" }, 1, function(v)
+	espD(SilentFOV, "SA_FOVOrigin", "FOV Origin", { "Mouse", "Screen Center" }, 1, function(v)
 		Write("SilentAim.FOVOrigin", v)
 	end)
+	espT(SilentFOV, "SA_FOVOutline", "Outline", true, "SilentAim.FOVOutline")
+	espC(SilentFOV, "SA_FOVOutlineColor", "Outline Color", Color3.fromRGB(0, 0, 0), "SilentAim.FOVOutlineColor")
+	espS(SilentFOV, "SA_FOVOutlineThickness", "Outline Size", 2, 0, 10, 0, "SilentAim.FOVOutlineThickness")
 end
 
 local SilentTarget = MakeSection("Silent Aim", "Left")
@@ -9938,8 +10032,12 @@ if SilentTarget ~= nil then
 	espD(SilentTarget, "SA_TargetPart", "Target Part", { "Head", "HumanoidRootPart", "UpperTorso", "LowerTorso", "Random", "Closest Part" }, 1, function(v)
 		Write("SilentAim.TargetPart", v)
 	end)
-	espD(SilentTarget, "SA_AimMode", "Aim Mode", { "Closest To Crosshair", "Closest Distance", "Lowest Screen Distance" }, 1, function(v)
-		Write("SilentAim.AimMode", v)
+	espD(SilentTarget, "SA_AimMode", "Aim Mode", { "Closest To Mouse", "Closest Distance" }, 1, function(v)
+		if v == "Closest To Crosshair" or v == "Lowest Screen Distance" then
+			Write("SilentAim.AimMode", "Closest To Mouse")
+		else
+			Write("SilentAim.AimMode", v)
+		end
 	end)
 	espT(SilentTarget, "SA_Sticky", "Sticky Target", true, "SilentAim.StickyTarget")
 	espS(SilentTarget, "SA_SwitchDelay", "Target Switch Delay", 0.25, 0, 1, 2, "SilentAim.TargetSwitchDelay")
@@ -10031,16 +10129,20 @@ task.spawn(function()
 		end
 		local okS, sinfo = pcall(function() return A.GetSilentInfo() end)
 		if okS and type(sinfo) == "table" then
-			SetLabel(El.SilentDbg, "Silent: " .. tostring(sinfo.AimMethod or "-")
+			SetLabel(El.SilentDbg, "Silent: " .. ((sinfo.Enabled and "ON") or "OFF")
+				.. " | Key: " .. ((sinfo.KeyHeld and "YES") or "NO")
 				.. " | Tgt " .. tostring(sinfo.Target or "None")
-				.. " " .. tostring(sinfo.Part or "-")
-				.. " " .. string.format("%.0f", sinfo.ScreenDist or -1)
-				.. " [" .. tostring(sinfo.Source or "?") .. "]")
-			SetLabel(El.SilentDbg2, "Fire: " .. tostring(sinfo.FirePipeline or "?")
-				.. " | Override: " .. tostring(sinfo.Override or "?")
-				.. " | Hits: " .. tostring(sinfo.HookHits or 0)
-				.. " | AW: " .. tostring(sinfo.Aimwork or "?")
-				.. " | Cam: UNCHANGED")
+				.. " " .. tostring(sinfo.Part or "-"))
+			local scrXY = "-"
+			if sinfo.Target ~= nil then
+				scrXY = string.format("%.0f,%.0f", sinfo.ScreenX or -1, sinfo.ScreenY or -1)
+			end
+			SetLabel(El.SilentDbg2, "FOV " .. tostring(sinfo.FOVOrigin or "?")
+				.. " | Mouse " .. tostring(sinfo.MouseX or -1) .. "," .. tostring(sinfo.MouseY or -1)
+				.. " | R " .. tostring(sinfo.FOV or 0)
+				.. " | Scr " .. scrXY
+				.. " | MouseDist " .. string.format("%.0f", sinfo.MouseDist or -1)
+				.. " | InFOV: " .. ((sinfo.InFOV and "YES") or "NO"))
 			local awd = sinfo.AWDiag
 			if type(awd) ~= "table" then
 				awd = {}
@@ -10050,7 +10152,13 @@ task.spawn(function()
 				.. tostring(awd.instance) .. "/" .. tostring(awd.tracker) .. "/"
 				.. tostring(awd.iterate) .. " | Sel: " .. tostring(awd.selected)
 				.. " | Pred: " .. tostring(sinfo.Predicted or "-")
-				.. " | Dir: " .. tostring(sinfo.AimDirection or "-"))
+				.. " | Dir: " .. tostring(sinfo.AimDirection or "-")
+				.. " | Behind: " .. tostring(sinfo.Behind or 0)
+				.. " | Fire: " .. tostring(sinfo.FirePipeline or "?")
+				.. " | Override: " .. tostring(sinfo.Override or "?")
+				.. " | Apps: " .. tostring(sinfo.OverrideApps or 0)
+				.. " | Ev: " .. tostring(sinfo.FireEvents or 0)
+				.. " | Cam: UNCHANGED")
 		end
 	end
 end)

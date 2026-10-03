@@ -17,6 +17,8 @@ FS._toolConns = {}
 FS._toolTime = 0
 FS._listeners = {}
 FS._caps = nil
+FS._mbEvents = 0
+FS._toolEvents = 0
 
 local function now()
 	local ok, t = pcall(function() return tick() end)
@@ -54,8 +56,10 @@ local function fireEvent(source)
 	local t = now()
 	if source == "mb" then
 		FS._mbTime = t
+		FS._mbEvents = (FS._mbEvents or 0) + 1
 	else
 		FS._toolTime = t
+		FS._toolEvents = (FS._toolEvents or 0) + 1
 	end
 	for _, fn in next, FS._listeners do
 		pcall(fn, source)
@@ -157,6 +161,14 @@ function FS.GetLastFireTime()
 		return a
 	end
 	return b
+end
+
+function FS.FireEvents()
+	return (FS._mbEvents or 0) + (FS._toolEvents or 0)
+end
+
+function FS.ToolEvents()
+	return FS._toolEvents or 0
 end
 
 function FS.OnFire(callback)

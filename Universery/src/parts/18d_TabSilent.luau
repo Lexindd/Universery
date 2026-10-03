@@ -96,15 +96,18 @@ if SilentMain ~= nil then
 				A.SilentAim.EnabledKey = Enum.UserInputType.MouseButton2
 				A.SilentAim.KeyMode = "Hold"
 				A.SilentAim.FOV = 150
-				A.SilentAim.ShowFOV = false
+				A.SilentAim.ShowFOV = true
 				A.SilentAim.FOVColor = Color3.fromRGB(255, 255, 255)
 				A.SilentAim.FOVThickness = 1
 				A.SilentAim.FOVTransparency = 0
 				A.SilentAim.FOVFilled = false
 				A.SilentAim.FOVFillTransparency = 0.5
-				A.SilentAim.FOVOrigin = "Screen Center"
+				A.SilentAim.FOVOutline = true
+				A.SilentAim.FOVOutlineColor = Color3.fromRGB(0, 0, 0)
+				A.SilentAim.FOVOutlineThickness = 2
+				A.SilentAim.FOVOrigin = "Mouse"
 				A.SilentAim.TargetPart = "Head"
-				A.SilentAim.AimMode = "Closest To Crosshair"
+				A.SilentAim.AimMode = "Closest To Mouse"
 				A.SilentAim.TeamCheck = true
 				A.SilentAim.VisibilityCheck = false
 				A.SilentAim.MaxDistance = 1000
@@ -122,15 +125,18 @@ if SilentMain ~= nil then
 			if El.SA_Protect ~= nil then pcall(function() El.SA_Protect:UpdateState(false) end) end
 			if El.SA_Hook ~= nil then pcall(function() El.SA_Hook:UpdateState(true) end) end
 			if El.SA_FOV ~= nil then pcall(function() El.SA_FOV:UpdateValue(150) end) end
-			if El.SA_ShowFOV ~= nil then pcall(function() El.SA_ShowFOV:UpdateState(false) end) end
+			if El.SA_ShowFOV ~= nil then pcall(function() El.SA_ShowFOV:UpdateState(true) end) end
 			if El.SA_FOVColor ~= nil then pcall(function() El.SA_FOVColor:SetColor(Color3.fromRGB(255, 255, 255)) end) end
 			if El.SA_FOVThickness ~= nil then pcall(function() El.SA_FOVThickness:UpdateValue(1) end) end
 			if El.SA_FOVTransparency ~= nil then pcall(function() El.SA_FOVTransparency:UpdateValue(0) end) end
 			if El.SA_FOVFilled ~= nil then pcall(function() El.SA_FOVFilled:UpdateState(false) end) end
 			if El.SA_FOVFillTransparency ~= nil then pcall(function() El.SA_FOVFillTransparency:UpdateValue(0.5) end) end
-			if El.SA_FOVOrigin ~= nil then pcall(function() El.SA_FOVOrigin:UpdateSelection("Screen Center") end) end
+			if El.SA_FOVOutline ~= nil then pcall(function() El.SA_FOVOutline:UpdateState(true) end) end
+			if El.SA_FOVOutlineColor ~= nil then pcall(function() El.SA_FOVOutlineColor:SetColor(Color3.fromRGB(0, 0, 0)) end) end
+			if El.SA_FOVOutlineThickness ~= nil then pcall(function() El.SA_FOVOutlineThickness:UpdateValue(2) end) end
+			if El.SA_FOVOrigin ~= nil then pcall(function() El.SA_FOVOrigin:UpdateSelection("Mouse") end) end
 			if El.SA_TargetPart ~= nil then pcall(function() El.SA_TargetPart:UpdateSelection("Head") end) end
-			if El.SA_AimMode ~= nil then pcall(function() El.SA_AimMode:UpdateSelection("Closest To Crosshair") end) end
+			if El.SA_AimMode ~= nil then pcall(function() El.SA_AimMode:UpdateSelection("Closest To Mouse") end) end
 			if El.SA_Sticky ~= nil then pcall(function() El.SA_Sticky:UpdateState(true) end) end
 			if El.SA_SwitchDelay ~= nil then pcall(function() El.SA_SwitchDelay:UpdateValue(0.25) end) end
 			if El.SA_TeamCheck ~= nil then pcall(function() El.SA_TeamCheck:UpdateState(true) end) end
@@ -147,15 +153,18 @@ if SilentFOV ~= nil then
 	SilentFOV:Header({ Text = "FOV" })
 
 	espS(SilentFOV, "SA_FOV", "FOV Size", 150, 10, 1000, 0, "SilentAim.FOV")
-	espT(SilentFOV, "SA_ShowFOV", "Show FOV", false, "SilentAim.ShowFOV")
+	espT(SilentFOV, "SA_ShowFOV", "Show FOV", true, "SilentAim.ShowFOV")
 	espC(SilentFOV, "SA_FOVColor", "FOV Color", Color3.fromRGB(255, 255, 255), "SilentAim.FOVColor")
 	espS(SilentFOV, "SA_FOVThickness", "Thickness", 1, 1, 5, 0, "SilentAim.FOVThickness")
 	espS(SilentFOV, "SA_FOVTransparency", "Transparency", 0, 0, 1, 2, "SilentAim.FOVTransparency")
 	espT(SilentFOV, "SA_FOVFilled", "Filled", false, "SilentAim.FOVFilled")
 	espS(SilentFOV, "SA_FOVFillTransparency", "Fill Transparency", 0.5, 0, 1, 2, "SilentAim.FOVFillTransparency")
-	espD(SilentFOV, "SA_FOVOrigin", "FOV Origin", { "Screen Center", "Mouse" }, 1, function(v)
+	espD(SilentFOV, "SA_FOVOrigin", "FOV Origin", { "Mouse", "Screen Center" }, 1, function(v)
 		Write("SilentAim.FOVOrigin", v)
 	end)
+	espT(SilentFOV, "SA_FOVOutline", "Outline", true, "SilentAim.FOVOutline")
+	espC(SilentFOV, "SA_FOVOutlineColor", "Outline Color", Color3.fromRGB(0, 0, 0), "SilentAim.FOVOutlineColor")
+	espS(SilentFOV, "SA_FOVOutlineThickness", "Outline Size", 2, 0, 10, 0, "SilentAim.FOVOutlineThickness")
 end
 
 local SilentTarget = MakeSection("Silent Aim", "Left")
@@ -165,8 +174,12 @@ if SilentTarget ~= nil then
 	espD(SilentTarget, "SA_TargetPart", "Target Part", { "Head", "HumanoidRootPart", "UpperTorso", "LowerTorso", "Random", "Closest Part" }, 1, function(v)
 		Write("SilentAim.TargetPart", v)
 	end)
-	espD(SilentTarget, "SA_AimMode", "Aim Mode", { "Closest To Crosshair", "Closest Distance", "Lowest Screen Distance" }, 1, function(v)
-		Write("SilentAim.AimMode", v)
+	espD(SilentTarget, "SA_AimMode", "Aim Mode", { "Closest To Mouse", "Closest Distance" }, 1, function(v)
+		if v == "Closest To Crosshair" or v == "Lowest Screen Distance" then
+			Write("SilentAim.AimMode", "Closest To Mouse")
+		else
+			Write("SilentAim.AimMode", v)
+		end
 	end)
 	espT(SilentTarget, "SA_Sticky", "Sticky Target", true, "SilentAim.StickyTarget")
 	espS(SilentTarget, "SA_SwitchDelay", "Target Switch Delay", 0.25, 0, 1, 2, "SilentAim.TargetSwitchDelay")

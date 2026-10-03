@@ -15,7 +15,7 @@ local F = Universery.SilentGeneric
 local LPH = LPH_NO_VIRTUALIZE or function(f) return f end
 
 F._hooked = false
-F._hits = 0
+F._hookreads = 0
 F._error = ""
 F._how = "none"
 F._cam = nil
@@ -53,7 +53,7 @@ function F.HookFn(self, key)
 		if key == "CFrame" then
 			local cf = F._cf
 			if cf ~= nil then
-				F._hits = F._hits + 1
+				F._hookreads = F._hookreads + 1
 				return cf
 			end
 		elseif key == "ScreenPointToRay" or key == "ViewportPointToRay" then
@@ -61,7 +61,7 @@ function F.HookFn(self, key)
 			local tgt = F._pos
 			local org = F._org
 			if tgt ~= nil and org ~= nil then
-				F._hits = F._hits + 1
+				F._hookreads = F._hookreads + 1
 				return function(_, x, y, depth)
 					local d = tgt - org
 					local m = d.Magnitude
@@ -75,7 +75,7 @@ function F.HookFn(self, key)
 		elseif key == "GetRenderCFrame" then
 			local cf = F._cf
 			if cf ~= nil then
-				F._hits = F._hits + 1
+				F._hookreads = F._hookreads + 1
 				return function() return cf end
 			end
 		end
@@ -183,12 +183,12 @@ function F.SetOverride(on)
 	F._override = (on == true)
 end
 
-function F.Hits()
-	return F._hits or 0
+function F.HookReads()
+	return F._hookreads or 0
 end
 
 function F.Info()
-	return { hooked = F._hooked, how = F._how, error = F._error, hits = F._hits or 0, reads = F.Reads() }
+	return { hooked = F._hooked, how = F._how, error = F._error, hookreads = F._hookreads or 0, reads = F.Reads() }
 end
 
 
