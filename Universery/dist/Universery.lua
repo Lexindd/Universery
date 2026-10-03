@@ -3,6 +3,7 @@
 local __Modules = {}
 local __Loaded = {}
 local __Loading = {}
+local MOD_DIAG = false -- set true for module loader diagnostics
 local function Require(name)
 	if __Loaded[name] ~= nil then
 		return __Loaded[name]
@@ -11,7 +12,12 @@ local function Require(name)
 		error("Circular dependency: " .. tostring(name))
 	end
 	local factory = __Modules[name]
-	assert(factory, "Missing module: " .. tostring(name))
+	if type(factory) ~= "function" then
+		error("[Universery ModuleLoader] Invalid module factory: " .. tostring(name) .. " type=" .. type(factory), 2)
+	end
+	if MOD_DIAG then
+		print("[Universery ModuleLoader] require: " .. tostring(name) .. " factory type=" .. type(factory))
+	end
 	__Loading[name] = true
 	local result = factory(Require)
 	__Loading[name] = nil
@@ -3282,6 +3288,7 @@ local Universery = Require("registry")
 Universery.TeamResolver = Universery.TeamResolver or {}
 local TR = Universery.TeamResolver
 local D = {}
+local LPH = LPH_NO_VIRTUALIZE or function(f) return f end
 
 local TEAM_ATTR_NAMES = { Team = true, TeamId = true, TeamID = true, TeamName = true, Faction = true, FactionId = true, FactionID = true, FactionName = true, Side = true, SideId = true, SideID = true, Squad = true, SquadId = true, SquadID = true, Group = true, GroupId = true, GroupID = true, Alliance = true, AllianceId = true, AllianceID = true, Allegiance = true, Camp = true, CampId = true, CampID = true }
 local ROLE_DENY = { Role = true, RoleName = true, Class = true, Job = true, Kit = true, Loadout = true, Weapon = true, Perk = true, Character = true, Skin = true, Title = true }
@@ -3452,7 +3459,7 @@ end
 
 -- Cross-player consistency analysis (slow gate): an attribute/value/tag is only
 -- trusted as a team source when its values actually separate players.
-local AnalyzeSources = LPH_NO_VIRTUALIZE(function(Force)
+local AnalyzeSources = LPH(function(Force)
 	local cfg = D.Env.TeamResolver
 	local now = D.Tick()
 	if not Force and (now - TeamRanking.Time) < (cfg.ReanalyzeRate or 5) then
@@ -3588,7 +3595,7 @@ local function ClearTeamCache(Player)
 end
 
 -- One-time invalidation hooks per player (native team / neutral / attributes).
-local HookTeamInvalidation = LPH_NO_VIRTUALIZE(function(Player)
+local HookTeamInvalidation = LPH(function(Player)
 	local okU, uid = pcall(function() return D.__index(Player, "UserId") end)
 	if not okU or uid == nil or TeamHooked[uid] then
 		return
@@ -3607,7 +3614,7 @@ local HookTeamInvalidation = LPH_NO_VIRTUALIZE(function(Player)
 		D.Connect(D.__index(Player, "GetPropertyChangedSignal")(Player, "Neutral"), clearIt)
 	end)
 	pcall(function()
-		D.Connect(D.__index(Player, "AttributeChanged"), LPH_NO_VIRTUALIZE(function() clearIt() end))
+		D.Connect(D.__index(Player, "AttributeChanged"), LPH(function() clearIt() end))
 	end)
 end)
 
@@ -3635,7 +3642,7 @@ local function CustomSourcesExist()
 end
 
 -- Central resolver. Returns {TeamId, TeamName, TeamColor, Source, Confidence, Known}.
-local ResolveTeamInfo = LPH_NO_VIRTUALIZE(function(Player)
+local ResolveTeamInfo = LPH(function(Player)
 	HookTeamInvalidation(Player)
 	local cfg = D.Env.TeamResolver
 	local now = D.Tick()
@@ -3829,7 +3836,7 @@ end)
 
 -- Legacy native-only comparison (exact old semantics). Used when the resolver has
 -- no knowledge AND no custom sources exist anywhere (pure native/neutral game).
-local LegacyPairTeammates = LPH_NO_VIRTUALIZE(function(A, B)
+local LegacyPairTeammates = LPH(function(A, B)
 	local Settings = D.Env.Settings
 	local TA, TB
 	pcall(function() TA = D.__index(A, "Team") end)
@@ -3849,7 +3856,7 @@ local LegacyPairTeammates = LPH_NO_VIRTUALIZE(function(A, B)
 end)
 
 -- THE single team-relationship function. Everything else delegates here.
-local IsSameTeam = LPH_NO_VIRTUALIZE(function(A, B)
+local IsSameTeam = LPH(function(A, B)
 	if A == B then
 		return true
 	end
@@ -3881,7 +3888,7 @@ local IsSameTeam = LPH_NO_VIRTUALIZE(function(A, B)
 end)
 
 -- Team Check (nil-safe). Thin wrapper now; all logic lives in IsSameTeam.
-local IsTeammate = LPH_NO_VIRTUALIZE(function(Player)
+local IsTeammate = LPH(function(Player)
 	local Settings = D.Env.Settings
 
 	if Player == D.LocalPlayer then
@@ -3895,14 +3902,14 @@ local IsTeammate = LPH_NO_VIRTUALIZE(function(Player)
 	return IsSameTeam(D.LocalPlayer, Player)
 end)
 
-local IsNeutral = LPH_NO_VIRTUALIZE(function(Player)
+local IsNeutral = LPH(function(Player)
 	local Team
 	pcall(function() Team = D.__index(Player, "Team") end)
 	return Team == nil
 end)
 
 -- Friend list: one-time async build via the real Friends API, refreshed slowly.
-local RefreshFriends = LPH_NO_VIRTUALIZE(function()
+local RefreshFriends = LPH(function()
 	if FriendAPIUnavailable then
 		return
 	end
@@ -3928,7 +3935,7 @@ local RefreshFriends = LPH_NO_VIRTUALIZE(function()
 	FriendSetTime = D.Tick()
 end)
 
-local IsFriend = LPH_NO_VIRTUALIZE(function(Player)
+local IsFriend = LPH(function(Player)
 	if not D.Env.Settings.FriendCheck then
 		return false
 	end
