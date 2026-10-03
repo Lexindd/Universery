@@ -1,0 +1,871 @@
+--[[
+	Universal Aimbot x Obsidian UI
+	==============================
+	UI layer for the existing aimbot in aimbot.txt. This file contains NO targeting,
+	prediction, raycast, camera or player-loop logic. Every control writes directly
+	into the aimbot's live config tables (Settings / FOVSettings / Prediction /
+	Network / Smoothing / TeamResolver), which the aimbot's own systems consume.
+
+	Load order: run aimbot.txt FIRST (it auto-starts), then run this file.
+	Requires: Obsidian UI Library (loaded below via loadstring).
+
+	Architecture:
+		Obsidian controls -> Aimbot Config -> Targeting / Prediction / Smoothing
+]]
+
+--// Library
+
+local Repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+local Library = loadstring(game:HttpGet(Repo .. "Library.lua"))()
+local SaveManager = loadstring(game:HttpGet(Repo .. "addons/SaveManager.lua"))()
+
+local Options = Library.Options
+local Toggles = Library.Toggles
+
+--// Aimbot accessor (single integration point; never duplicated logic)
+
+local function Aim()
+	local ok, genv = pcall(function() return getgenv() end)
+	if not ok or genv == nil then
+		return nil
+	end
+	return genv.ExunysDeveloperAimbot
+end
+
+local function Notify(text)
+	pcall(function()
+		Library:Notify(text, 3)
+	end)
+	print("[AimbotUI]", text)
+end
+
+--// Window (created first so a missing aimbot still shows guidance)
+
+local Window = Library:CreateWindow({
+	Title = "Universal Aimbot",
+	Footer = "Obsidian UI",
+	Center = true,
+	AutoShow = true,
+})
+
+local Tabs = {
+	Main = Window:AddTab("Main", "user"),
+	Debug = Window:AddTab("Debug", "search"),
+	["UI Settings"] = Window:AddTab("UI Settings", "settings"),
+}
+
+local Aimbot = Aim()
+if Aimbot == nil then
+	local SetupBox = Tabs.Main:AddLeftGroupbox("Setup")
+	SetupBox:AddLabel("Aimbot not loaded. Run aimbot.txt first, then run this UI file.")
+	print("[AimbotUI] getgenv().ExunysDeveloperAimbot == nil; run aimbot.txt first.")
+	return
+end
+
+-- Spec default: aimbot starts OFF from the UI (file default is ON; UI takes over).
+pcall(function() Aimbot.Settings.Enabled = false end)
+
+-- Menu open state. While the menu is open, aiming is suspended so the mouse
+-- moves freely (UISuppressAim gates the aimbot's aim + trigger output only;
+-- visuals keep working). Declared early so the status loop below can read it.
+local UIIsOpen = true
+
+--// Value maps (UI labels -> exact aimbot setting values)
+
+local PriorityMap = {
+	["Best Score"] = "Score",
+	["Closest To Cursor"] = "ClosestToCursor",
+	["Closest Distance"] = "ClosestDistance",
+	["Lowest Health"] = "LowestHealth",
+	["Priority"] = "Priority",
+}
+local PriorityRev = {}
+for k, v in next, PriorityMap do PriorityRev[v] = k end
+
+local PartModeMap = {
+	["Head"] = { "Static", "Head" },
+	["UpperTorso"] = { "Static", "UpperTorso" },
+	["LowerTorso"] = { "Static", "LowerTorso" },
+	["HumanoidRootPart"] = { "Static", "HumanoidRootPart" },
+	["Torso"] = { "Static", "Torso" },
+	["Nearest Visible"] = { "ClosestVisible", nil },
+	["Custom"] = { "PriorityList", nil },
+}
+
+local TeamModeMap = {
+	["Auto"] = "Auto",
+	["Native Roblox"] = "Native",
+	["Custom Attribute"] = "Attributes",
+	["Value Object"] = "Values",
+	["Tags"] = "Tags",
+	["Game Adapter"] = "GameAdapter",
+	["Manual"] = "Manual",
+	["Disabled"] = "Disabled",
+}
+local TeamModeRev = {}
+for k, v in next, TeamModeMap do TeamModeRev[v] = k end
+
+local function Write(path, value)
+	local A = Aim()
+	if A == nil then
+		return
+	end
+	pcall(function()
+		if path == "Enabled" then A.Settings.Enabled = value
+		elseif path == "TriggerKey" then A.Settings.TriggerKey = value
+		elseif path == "Toggle" then A.Settings.Toggle = value
+		elseif path == "FOVEnabled" then A.FOVSettings.Enabled = value
+		elseif path == "Radius" then A.FOVSettings.Radius = value
+		elseif path == "FOVVisible" then A.FOVSettings.Visible = value
+		elseif path == "FOVColor" then A.FOVSettings.Color = value
+		elseif path == "FOVThickness" then A.FOVSettings.Thickness = value
+		elseif path == "FOVTransparency" then A.FOVSettings.Transparency = value
+		elseif path == "ShowLockRadius" then A.FOVSettings.ShowLockRadius = value
+		elseif path == "LockRadiusColor" then A.FOVSettings.LockRadiusColor = value
+		elseif path == "TeamCheck" then A.Settings.TeamCheck = value
+		elseif path == "TeamMode" then A.TeamResolver.Mode = value
+		elseif path == "UnknownBehavior" then A.TeamResolver.UnknownBehavior = value
+		elseif path == "FriendCheck" then A.Settings.FriendCheck = value
+		elseif path == "AliveCheck" then A.Settings.AliveCheck = value
+		elseif path == "WallCheck" then A.Settings.WallCheck = value
+		elseif path == "StrictVisibility" then A.Settings.StrictVisibility = value
+		elseif path == "PriorityMode" then A.Settings.PriorityMode = value
+		elseif path == "PartMode" then A.Settings.PartMode = value
+		elseif path == "LockPart" then A.Settings.LockPart = value
+		elseif path == "MaxDistance" then A.Settings.MaxDistance = value
+		elseif path == "LockRetentionRadius" then A.Settings.LockRetentionRadius = value
+		elseif path == "TargetStickiness" then A.Settings.TargetStickiness = value
+		elseif path == "SwitchThreshold" then A.Settings.SwitchThreshold = value
+		elseif path == "PingPrediction" then A.Network.PingPrediction = value
+		elseif path == "PingMultiplier" then A.Network.PingMultiplier = value
+		elseif path == "PingSmoothing" then A.Network.PingSmoothing = value
+		elseif path == "JitterCompensation" then A.Network.JitterCompensation = value
+		elseif path == "AutoCalibration" then A.Network.AutoCalibration = value
+		elseif path == "ConfidenceStrength" then A.Prediction.ConfidenceStrength = value
+		elseif path == "MinLatency" then A.Network.MinLatency = value
+		elseif path == "MaxLatency" then A.Network.MaxLatency = value
+		elseif path == "CalibrationStrength" then A.Network.CalibrationStrength = value
+		elseif path == "CalibrationRate" then A.Network.CalibrationRate = value
+		elseif path == "AdaptivePrediction" then A.Prediction.Adaptive = value
+		elseif path == "AdaptiveSmoothing" then A.Smoothing.Adaptive = value
+		elseif path == "SmoothMin" then A.Smoothing.Min = value
+		elseif path == "SmoothMax" then A.Smoothing.Max = value
+		elseif path == "SmoothError" then A.Smoothing.ErrorInfluence = value
+		elseif path == "SmoothDistance" then A.Smoothing.DistanceInfluence = value
+		elseif path == "SmoothVelocity" then A.Smoothing.VelocityInfluence = value
+		elseif path == "SmoothStability" then A.Smoothing.StabilityInfluence = value
+		elseif path == "Debugger" then A.Debugger.Enabled = value
+		elseif path == "AimbotMethod" then A.Settings.AimbotMethod = value
+		end
+	end)
+end
+
+--// LEFT: Aimbot groupbox
+
+local AimBox = Tabs.Main:AddLeftGroupbox("Aimbot")
+
+AimBox:AddToggle("AimbotEnabled", {
+	Text = "Enable Aimbot",
+	Default = false,
+	Tooltip = "Master switch. Writes Settings.Enabled (aimbot's own run gate).",
+	Callback = function(v) Write("Enabled", v) end,
+})
+
+AimBox:AddDropdown("AimbotMethod", {
+	Values = { "Camera", "Mouse" },
+	Default = "Camera",
+	Text = "Aimbot Method",
+	Tooltip = "Camera = CFrame aim. Mouse = cursor aim (camera untouched). Applies instantly, no restart; target and prediction state are kept.",
+	Callback = function(v) Write("AimbotMethod", (v == "Mouse") and "Mouse" or "Camera") end,
+})
+
+AimBox:AddLabel("Aim Key"):AddKeyPicker("AimKey", {
+	Default = "MB2",
+	Mode = "Hold",
+	Text = "Aim Key",
+	Tooltip = "Edits Settings.TriggerKey. Aiming itself is handled by the aimbot's own input listener.",
+	-- Functional listener stays the aimbot's single InputBegan/Ended pair; this callback is intentionally inert.
+	Callback = function() end,
+	ChangedCallback = function(newKey)
+		if newKey ~= nil then
+			Write("TriggerKey", newKey)
+		end
+	end,
+})
+
+AimBox:AddDropdown("AimMode", {
+	Values = { "Hold", "Toggle" },
+	Default = "Hold",
+	Text = "Aim Mode",
+	Tooltip = "Hold = aim while pressed. Toggle = press to latch.",
+	Callback = function(v) Write("Toggle", v == "Toggle") end,
+})
+
+AimBox:AddToggle("FOVEnabled", {
+	Text = "FOV Enabled",
+	Default = true,
+	Callback = function(v) Write("FOVEnabled", v) end,
+})
+
+AimBox:AddSlider("AcqFOV", {
+	Text = "Acquisition FOV",
+	Default = 180,
+	Min = 10,
+	Max = 500,
+	Rounding = 0,
+	Tooltip = "Where NEW targets may be selected. Applies live.",
+	Callback = function(v) Write("Radius", v) end,
+})
+
+AimBox:AddToggle("ShowFOV", {
+	Text = "Show FOV",
+	Default = true,
+	Callback = function(v) Write("FOVVisible", v) end,
+})
+
+AimBox:AddToggle("ShowLockRadius", {
+	Text = "Show Lock Radius",
+	Default = false,
+	Tooltip = "Second ring for the SMALL lock-retention radius (debug aid).",
+	Callback = function(v) Write("ShowLockRadius", v) end,
+})
+
+AimBox:AddLabel("FOV Color"):AddColorPicker("FOVColor", {
+	Default = Color3.fromRGB(255, 255, 255),
+	Title = "FOV Color",
+	Callback = function(c) Write("FOVColor", c) end,
+})
+
+AimBox:AddLabel("Lock Radius Color"):AddColorPicker("LockRadiusColor", {
+	Default = Color3.fromRGB(255, 150, 150),
+	Title = "Lock Radius Color",
+	Callback = function(c) Write("LockRadiusColor", c) end,
+})
+
+AimBox:AddSlider("FOVThickness", {
+	Text = "FOV Thickness",
+	Default = 1,
+	Min = 1,
+	Max = 5,
+	Rounding = 0,
+	Callback = function(v) Write("FOVThickness", v) end,
+})
+
+AimBox:AddSlider("FOVTransparency", {
+	Text = "FOV Transparency",
+	Default = 1,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Callback = function(v) Write("FOVTransparency", v) end,
+})
+
+--// LEFT: Filters groupbox (TeamResolver is controlled, never reimplemented)
+
+local FilterBox = Tabs.Main:AddLeftGroupbox("Filters")
+
+FilterBox:AddToggle("TeamCheck", {
+	Text = "Team Check",
+	Default = true,
+	Tooltip = "Same-team targets are never targeted. Uses the Universal Team Resolver.",
+	Callback = function(v) Write("TeamCheck", v) end,
+})
+
+FilterBox:AddDropdown("TeamDetectionMode", {
+	Values = { "Auto", "Native Roblox", "Custom Attribute", "Value Object", "Tags", "Game Adapter", "Manual", "Disabled" },
+	Default = "Auto",
+	Text = "Team Detection Mode",
+	Tooltip = "Which team source the resolver uses. Auto prefers meaningful native teams.",
+	Callback = function(v) Write("TeamMode", TeamModeMap[v] or "Auto") end,
+})
+
+FilterBox:AddDropdown("UnknownTeamBehavior", {
+	Values = { "Ignore", "Target" },
+	Default = "Ignore",
+	Text = "Unknown Team Behavior",
+	Tooltip = "UNKNOWN team = Ignore (strict, skip) or Target (permissive).",
+	Callback = function(v) Write("UnknownBehavior", v) end,
+})
+
+FilterBox:AddToggle("FriendCheck", {
+	Text = "Friend Check",
+	Default = true,
+	Callback = function(v) Write("FriendCheck", v) end,
+})
+
+FilterBox:AddToggle("AliveCheck", {
+	Text = "Alive Check",
+	Default = true,
+	Tooltip = "Dead targets are invalid. No separate death detector here.",
+	Callback = function(v) Write("AliveCheck", v) end,
+})
+
+FilterBox:AddToggle("VisibilityCheck", {
+	Text = "Visibility Check",
+	Default = true,
+	Tooltip = "Obstructed targets are rejected (strict) or scored lower.",
+	Callback = function(v) Write("WallCheck", v) end,
+})
+
+FilterBox:AddToggle("StrictVisibility", {
+	Text = "Strict Visibility",
+	Default = true,
+	Callback = function(v) Write("StrictVisibility", v) end,
+})
+
+--// LEFT: Smoothing groupbox
+
+local SmoothBox = Tabs.Main:AddLeftGroupbox("Smoothing")
+
+SmoothBox:AddToggle("AdaptiveSmoothing", {
+	Text = "Adaptive Smoothing",
+	Default = true,
+	Callback = function(v) Write("AdaptiveSmoothing", v) end,
+})
+
+SmoothBox:AddSlider("SmoothMin", {
+	Text = "Minimum Smoothing",
+	Default = 0.08,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Callback = function(v) Write("SmoothMin", v) end,
+})
+
+SmoothBox:AddSlider("SmoothMax", {
+	Text = "Maximum Smoothing",
+	Default = 0.9,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Callback = function(v) Write("SmoothMax", v) end,
+})
+
+SmoothBox:AddSlider("SmoothError", {
+	Text = "Aim Error Influence",
+	Default = 0.6,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Callback = function(v) Write("SmoothError", v) end,
+})
+
+SmoothBox:AddSlider("SmoothDistance", {
+	Text = "Distance Influence",
+	Default = 0.2,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Callback = function(v) Write("SmoothDistance", v) end,
+})
+
+SmoothBox:AddSlider("SmoothVelocity", {
+	Text = "Velocity Influence",
+	Default = 0.3,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Callback = function(v) Write("SmoothVelocity", v) end,
+})
+
+SmoothBox:AddSlider("SmoothStability", {
+	Text = "Stability Influence",
+	Default = 0.4,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Callback = function(v) Write("SmoothStability", v) end,
+})
+
+--// RIGHT: Targeting groupbox
+
+local TargetBox = Tabs.Main:AddRightGroupbox("Targeting")
+
+TargetBox:AddDropdown("TargetSelection", {
+	Values = { "Best Score", "Closest To Cursor", "Closest Distance", "Lowest Health", "Priority" },
+	Default = "Best Score",
+	Text = "Target Selection",
+	Callback = function(v) Write("PriorityMode", PriorityMap[v] or "Score") end,
+})
+
+TargetBox:AddDropdown("TargetPart", {
+	Values = { "Head", "UpperTorso", "LowerTorso", "HumanoidRootPart", "Torso", "Nearest Visible", "Custom" },
+	Default = "Head",
+	Text = "Target Part",
+	Tooltip = "Named parts aim statically; Nearest Visible scores visible parts; Custom uses the aimbot's TargetParts priority list.",
+	Callback = function(v)
+		local m = PartModeMap[v]
+		if m ~= nil then
+			if v == "Nearest Visible" then
+				Write("PartMode", "ClosestVisible")
+			elseif v == "Custom" then
+				Write("PartMode", "PriorityList")
+			else
+				Write("PartMode", m[1])
+				Write("LockPart", m[2])
+			end
+		end
+	end,
+})
+
+local SavedMaxDist = 1000
+TargetBox:AddToggle("UseDistanceLimit", {
+	Text = "Use Distance Limit",
+	Default = true,
+	Callback = function(v)
+		local A = Aim()
+		if A == nil then
+			return
+		end
+		if v then
+			Write("MaxDistance", SavedMaxDist)
+		else
+			pcall(function() SavedMaxDist = A.Settings.MaxDistance end)
+			Write("MaxDistance", 100000)
+		end
+	end,
+})
+
+TargetBox:AddSlider("MaxDistance", {
+	Text = "Max Distance",
+	Default = 1000,
+	Min = 0,
+	Max = 5000,
+	Rounding = 0,
+	Suffix = "st",
+	Callback = function(v)
+		SavedMaxDist = v
+		Write("MaxDistance", v)
+	end,
+})
+
+TargetBox:AddSlider("LockRetention", {
+	Text = "Lock Retention Radius",
+	Default = 30,
+	Min = 5,
+	Max = 200,
+	Rounding = 0,
+	Tooltip = "Small radius that keeps the CURRENT lock. Applies to the next lock (anchored at acquisition). Never equals acquisition FOV automatically.",
+	Callback = function(v) Write("LockRetentionRadius", v) end,
+})
+
+local SavedStick = 0.5
+TargetBox:AddToggle("EnableStickiness", {
+	Text = "Enable Stickiness",
+	Default = true,
+	Tooltip = "Stickiness only chooses BETWEEN valid targets; it never overrides hard validity.",
+	Callback = function(v)
+		if v then
+			Write("TargetStickiness", SavedStick)
+		else
+			local A = Aim()
+			if A ~= nil then
+				pcall(function() SavedStick = A.Settings.TargetStickiness end)
+			end
+			Write("TargetStickiness", 0)
+		end
+	end,
+})
+
+TargetBox:AddSlider("StickinessStrength", {
+	Text = "Stickiness Strength",
+	Default = 0.5,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Callback = function(v)
+		SavedStick = v
+		Write("TargetStickiness", v)
+	end,
+})
+
+TargetBox:AddSlider("SwitchThreshold", {
+	Text = "Switch Threshold",
+	Default = 0.12,
+	Min = 0,
+	Max = 0.5,
+	Rounding = 2,
+	Tooltip = "A challenger must beat the current target by this much to steal the lock.",
+	Callback = function(v) Write("SwitchThreshold", v) end,
+})
+
+--// RIGHT: Prediction groupbox (writes only; math stays in the aimbot)
+
+local PredBox = Tabs.Main:AddRightGroupbox("Prediction")
+
+PredBox:AddToggle("PredictionMaster", {
+	Text = "Ping Prediction",
+	Default = true,
+	Tooltip = "Master switch: latency-derived prediction time. OFF falls back to legacy paths.",
+	Callback = function(v) Write("PingPrediction", v) end,
+})
+
+PredBox:AddToggle("AdaptivePrediction", {
+	Text = "Adaptive Prediction",
+	Default = true,
+	Tooltip = "Legacy velocity-adaptive path (used when ping is unavailable).",
+	Callback = function(v) Write("AdaptivePrediction", v) end,
+})
+
+PredBox:AddSlider("PingMultiplier", {
+	Text = "Ping Multiplier",
+	Default = 1,
+	Min = 0.5,
+	Max = 1.5,
+	Rounding = 2,
+	Callback = function(v) Write("PingMultiplier", v) end,
+})
+
+PredBox:AddToggle("PingSmoothing", {
+	Text = "Ping Smoothing",
+	Default = true,
+	Callback = function(v) Write("PingSmoothing", v) end,
+})
+
+PredBox:AddToggle("JitterCompensation", {
+	Text = "Jitter Compensation",
+	Default = true,
+	Callback = function(v) Write("JitterCompensation", v) end,
+})
+
+PredBox:AddToggle("AutoCalibration", {
+	Text = "Auto Calibration",
+	Default = true,
+	Tooltip = "Slow self-correction of overshoot/undershoot bias.",
+	Callback = function(v) Write("AutoCalibration", v) end,
+})
+
+PredBox:AddSlider("PredictionStrength", {
+	Text = "Prediction Strength",
+	Default = 0.6,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Tooltip = "How strongly prediction confidence scales the lead (ConfidenceStrength).",
+	Callback = function(v) Write("ConfidenceStrength", v) end,
+})
+
+PredBox:AddSlider("MinPrediction", {
+	Text = "Min Prediction",
+	Default = 0.02,
+	Min = 0,
+	Max = 0.2,
+	Rounding = 3,
+	Tooltip = "Floor for the latency-derived lead (Network.MinLatency).",
+	Callback = function(v) Write("MinLatency", v) end,
+})
+
+PredBox:AddSlider("MaxPrediction", {
+	Text = "Max Prediction",
+	Default = 0.3,
+	Min = 0.05,
+	Max = 0.5,
+	Rounding = 2,
+	Tooltip = "Ceiling for the latency-derived lead (Network.MaxLatency).",
+	Callback = function(v) Write("MaxLatency", v) end,
+})
+
+PredBox:AddSlider("CalibrationStrength", {
+	Text = "Calibration Strength",
+	Default = 1,
+	Min = 0,
+	Max = 2,
+	Rounding = 2,
+	Callback = function(v) Write("CalibrationStrength", v) end,
+})
+
+PredBox:AddSlider("LearningRate", {
+	Text = "Learning Rate",
+	Default = 0.05,
+	Min = 0,
+	Max = 0.2,
+	Rounding = 3,
+	Callback = function(v) Write("CalibrationRate", v) end,
+})
+
+--// RIGHT: Utility groupbox (panic, reset, status)
+
+local UtilBox = Tabs.Main:AddRightGroupbox("Utility")
+
+UtilBox:AddButton({
+	Text = "Panic / Stop Aimbot",
+	Func = function()
+		local A = Aim()
+		if A ~= nil and type(A.Panic) == "function" then
+			pcall(function() A.Panic() end)
+			pcall(function() Options.AimbotEnabled:SetValue(false) end)
+			Notify("Panic: aimbot disabled, lock cleared.")
+		else
+			Notify("Panic unavailable (aimbot missing).")
+		end
+	end,
+}):AddKeyPicker("PanicKey", {
+	Default = "F8",
+	Text = "Panic",
+	Mode = "Press",
+	Callback = function()
+		local A = Aim()
+		if A ~= nil and type(A.Panic) == "function" then
+			pcall(function() A.Panic() end)
+			pcall(function() Options.AimbotEnabled:SetValue(false) end)
+		end
+	end,
+})
+
+UtilBox:AddLabel("Toggle Aimbot"):AddKeyPicker("ToggleAimbotKey", {
+	Default = "F7",
+	Text = "Toggle Aimbot",
+	Mode = "Press",
+	Callback = function()
+		pcall(function()
+			Options.AimbotEnabled:SetValue(not Options.AimbotEnabled.Value)
+		end)
+	end,
+})
+
+local DEFAULTS = {
+	Enabled = false, AimbotMethod = "Camera", TriggerKey = "MB2", Toggle = false,
+	FOVEnabled = true, Radius = 180, FOVVisible = true,
+	FOVColor = Color3.fromRGB(255, 255, 255), FOVThickness = 1, FOVTransparency = 1,
+	ShowLockRadius = false, LockRadiusColor = Color3.fromRGB(255, 150, 150),
+	TeamCheck = true, TeamMode = "Auto", UnknownBehavior = "Ignore",
+	FriendCheck = true, AliveCheck = true, WallCheck = true, StrictVisibility = true,
+	PriorityMode = "Score", PartMode = "Static", LockPart = "Head",
+	MaxDistance = 1000, LockRetentionRadius = 30,
+	TargetStickiness = 0.5, SwitchThreshold = 0.12,
+	PingPrediction = true, PingMultiplier = 1, PingSmoothing = true,
+	JitterCompensation = true, AutoCalibration = true,
+	ConfidenceStrength = 0.6, MinLatency = 0.02, MaxLatency = 0.3,
+	CalibrationStrength = 1, CalibrationRate = 0.05,
+	AdaptivePrediction = true, AdaptiveSmoothing = true,
+	SmoothMin = 0.08, SmoothMax = 0.9, SmoothError = 0.6,
+	SmoothDistance = 0.2, SmoothVelocity = 0.3, SmoothStability = 0.4,
+}
+
+UtilBox:AddButton({
+	Text = "Reset Aimbot Settings",
+	Func = function()
+		local A = Aim()
+		if A == nil then
+			Notify("Reset failed: aimbot missing.")
+			return
+		end
+		pcall(function()
+			A.Settings.Enabled = false
+			A.Settings.Toggle = false
+			A.Settings.AimbotMethod = "Camera"
+			A.Settings.TriggerKey = Enum.UserInputType.MouseButton2
+			A.FOVSettings.Enabled = true
+			A.FOVSettings.Radius = 180
+			A.FOVSettings.Visible = true
+			A.FOVSettings.Color = DEFAULTS.FOVColor
+			A.FOVSettings.Thickness = 1
+			A.FOVSettings.Transparency = 1
+			A.FOVSettings.ShowLockRadius = false
+			A.FOVSettings.LockRadiusColor = DEFAULTS.LockRadiusColor
+			A.Settings.TeamCheck = true
+			A.TeamResolver.Mode = "Auto"
+			A.TeamResolver.UnknownBehavior = "Ignore"
+			A.Settings.FriendCheck = true
+			A.Settings.AliveCheck = true
+			A.Settings.WallCheck = true
+			A.Settings.StrictVisibility = true
+			A.Settings.PriorityMode = "Score"
+			A.Settings.PartMode = "Static"
+			A.Settings.LockPart = "Head"
+			A.Settings.MaxDistance = 1000
+			A.Settings.LockRetentionRadius = 30
+			A.Settings.TargetStickiness = 0.5
+			A.Settings.SwitchThreshold = 0.12
+			A.Network.PingPrediction = true
+			A.Network.PingMultiplier = 1
+			A.Network.PingSmoothing = true
+			A.Network.JitterCompensation = true
+			A.Network.AutoCalibration = true
+			A.Prediction.ConfidenceStrength = 0.6
+			A.Network.MinLatency = 0.02
+			A.Network.MaxLatency = 0.3
+			A.Network.CalibrationStrength = 1
+			A.Network.CalibrationRate = 0.05
+			A.Prediction.Adaptive = true
+			A.Smoothing.Adaptive = true
+			A.Smoothing.Min = 0.08
+			A.Smoothing.Max = 0.9
+			A.Smoothing.ErrorInfluence = 0.6
+			A.Smoothing.DistanceInfluence = 0.2
+			A.Smoothing.VelocityInfluence = 0.3
+			A.Smoothing.StabilityInfluence = 0.4
+		end)
+		SavedMaxDist = 1000
+		SavedStick = 0.5
+		local function sync(idx, val)
+			pcall(function() Options[idx]:SetValue(val) end)
+		end
+		sync("AimbotEnabled", false)
+		sync("AimbotMethod", "Camera")
+		sync("AimKey", { "MB2", "Hold" })
+		sync("AimMode", "Hold")
+		sync("FOVEnabled", true)
+		sync("AcqFOV", 180)
+		sync("ShowFOV", true)
+		sync("ShowLockRadius", false)
+		pcall(function() Options.FOVColor:SetValueRGB(DEFAULTS.FOVColor) end)
+		pcall(function() Options.LockRadiusColor:SetValueRGB(DEFAULTS.LockRadiusColor) end)
+		sync("FOVThickness", 1)
+		sync("FOVTransparency", 1)
+		sync("TeamCheck", true)
+		sync("TeamDetectionMode", "Auto")
+		sync("UnknownTeamBehavior", "Ignore")
+		sync("FriendCheck", true)
+		sync("AliveCheck", true)
+		sync("VisibilityCheck", true)
+		sync("StrictVisibility", true)
+		sync("TargetSelection", "Best Score")
+		sync("TargetPart", "Head")
+		sync("UseDistanceLimit", true)
+		sync("MaxDistance", 1000)
+		sync("LockRetention", 30)
+		sync("EnableStickiness", true)
+		sync("StickinessStrength", 0.5)
+		sync("SwitchThreshold", 0.12)
+		sync("PredictionMaster", true)
+		sync("AdaptivePrediction", true)
+		sync("PingMultiplier", 1)
+		sync("PingSmoothing", true)
+		sync("JitterCompensation", true)
+		sync("AutoCalibration", true)
+		sync("PredictionStrength", 0.6)
+		sync("MinPrediction", 0.02)
+		sync("MaxPrediction", 0.3)
+		sync("CalibrationStrength", 1)
+		sync("LearningRate", 0.05)
+		sync("AdaptiveSmoothing", true)
+		sync("SmoothMin", 0.08)
+		sync("SmoothMax", 0.9)
+		sync("SmoothError", 0.6)
+		sync("SmoothDistance", 0.2)
+		sync("SmoothVelocity", 0.3)
+		sync("SmoothStability", 0.4)
+		Notify("Aimbot settings reset to defaults.")
+	end,
+})
+
+local StatusLabel = UtilBox:AddLabel("Aimbot: OFF | Target: None")
+
+--// DEBUG TAB (throttled reads of existing public APIs only)
+
+local DbgBox = Tabs.Debug:AddLeftGroupbox("Target")
+local DbgTarget = DbgBox:AddLabel("Target: None")
+local DbgTeam = DbgBox:AddLabel("Team: -")
+local DbgFOV = DbgBox:AddLabel("FOV: -")
+
+local NetBox = Tabs.Debug:AddRightGroupbox("Network")
+local NetLbl = NetBox:AddLabel("Ping: -")
+local PredLbl = NetBox:AddLabel("Prediction: -")
+local ChecksLbl = NetBox:AddLabel("Checks: -")
+
+DbgBox:AddToggle("AimbotDebugger", {
+	Text = "Aimbot Print Debugger",
+	Default = false,
+	Tooltip = "Enables the aimbot's own throttled console debug (Debugger.Enabled).",
+	Callback = function(v) Write("Debugger", v) end,
+})
+
+DbgBox:AddButton({
+	Text = "Scan Team Sources",
+	Func = function()
+		local A = Aim()
+		if A ~= nil and type(A.ScanTeamSources) == "function" then
+			pcall(function() A.ScanTeamSources() end)
+		else
+			Notify("ScanTeamSources unavailable.")
+		end
+	end,
+})
+
+local function SetLabel(lbl, text)
+	local ok = pcall(function() lbl:SetText(text) end)
+	if not ok then
+		pcall(function() lbl.Text = text end)
+	end
+end
+
+task.spawn(function()
+	while true do
+		task.wait(0.3)
+		local A = Aim()
+		if A == nil then
+			break
+		end
+		local okI, info = pcall(function() return A.GetTargetInfo() end)
+		local okD, diag = pcall(function() return A.GetDiagnostics() end)
+		if okI and type(info) == "table" then
+			local tname = info.Target or "None"
+			SetLabel(DbgTarget, "Target: " .. tostring(tname) .. "  Score " .. string.format("%.2f", info.Score or -1))
+			SetLabel(DbgFOV, "Eff " .. string.format("%.3f", info.EffTime or 0) .. "s  Conf " .. string.format("%d%%", math.floor((info.Confidence or 0) * 100)))
+			SetLabel(PredLbl, "Prediction: " .. string.format("%.3fs", info.EffTime or 0) .. "  Vel " .. string.format("%.1f", info.Velocity or 0) .. "  Stable " .. tostring(info.Stable))
+		end
+		if okD and type(diag) == "table" then
+			SetLabel(StatusLabel, "Aimbot: " .. (tostring((A.Settings.Enabled and "ON") or "OFF")) .. " | Target: " .. tostring((okI and info.Target) or "None") .. (UIIsOpen and " | UI OPEN (aim paused)" or "") .. " | Method: " .. tostring((okI and info.Method) or (A.Settings.AimbotMethod or "Camera")))
+			SetLabel(DbgTeam, "Team: " .. tostring(diag.TargetTeam or "-") .. " | Src " .. tostring(diag.TeamSource or "?") .. " " .. string.format("%.2f", diag.TeamConfidence or 0))
+			SetLabel(NetLbl, "Ping: " .. tostring(diag.Ping or 0) .. "ms / " .. tostring(diag.SmoothedPing or 0) .. "ms  Jit " .. tostring(diag.Jitter or 0) .. "ms  " .. tostring(diag.Network or "?"))
+			SetLabel(ChecksLbl, "TeamCheck:" .. tostring(diag.TeamCheck) .. " Wall:" .. tostring(diag.WallCheck) .. " FPS-src Retain:" .. tostring(diag.RetainRadius or 0) .. " | Method: " .. tostring((okI and info.Method) or "?"))
+		end
+	end
+end)
+
+--// UI SETTINGS TAB (menu + config persistence via Obsidian SaveManager)
+
+local MenuBox = Tabs["UI Settings"]:AddLeftGroupbox("Menu")
+MenuBox:AddToggle("KeybindMenuOpen", {
+	Default = (Library.KeybindFrame ~= nil and Library.KeybindFrame.Visible) or false,
+	Text = "Open Keybind Menu",
+	Callback = function(v)
+		if Library.KeybindFrame ~= nil then
+			Library.KeybindFrame.Visible = v
+		end
+	end,
+})
+MenuBox:AddDropdown("NotificationSide", {
+	Values = { "Left", "Right" },
+	Default = "Right",
+	Text = "Notification Side",
+	Callback = function(v) Library:SetNotifySide(v) end,
+})
+MenuBox:AddDropdown("DPIDropdown", {
+	Values = { "50%", "75%", "100%", "125%", "150%", "175%", "200%" },
+	Default = "100%",
+	Text = "DPI Scale",
+	Callback = function(v)
+		v = v:gsub("%%", "")
+		Library:SetDPIScale(tonumber(v))
+	end,
+})
+local function setUIOpen(open)
+	UIIsOpen = open and true or false
+	local A = Aim()
+	if A ~= nil then
+		pcall(function() A.UISuppressAim = not UIIsOpen end)
+	end
+	pcall(function() Window:Toggle(UIIsOpen) end)
+end
+MenuBox:AddLabel("Menu bind"):AddKeyPicker("MenuKeybind", {
+	Default = "RightShift",
+	NoUI = true,
+	Text = "Menu keybind",
+	Mode = "Press",
+	Tooltip = "Opens/closes the menu. While open, aiming is suspended so the mouse moves freely.",
+	Callback = function() setUIOpen(not UIIsOpen) end,
+})
+setUIOpen(true)
+
+pcall(function()
+	SaveManager:SetLibrary(Library)
+	SaveManager:IgnoreThemeSettings()
+	SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
+	SaveManager:SetFolder("UniversalAimbot")
+	SaveManager:BuildConfigSection(Tabs["UI Settings"])
+	SaveManager:LoadAutoloadConfig()
+end)
+
+Notify("Aimbot UI loaded. Aimbot starts OFF; enable it in Main.")

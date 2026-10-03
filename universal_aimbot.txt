@@ -1,0 +1,3797 @@
+-- Universal Aimbot + Obsidian UI (SINGLE FILE)
+-- Tek dosya: aimbot gomulu gelir (auto-start, OFF baslar), tum kontrol UI uzerinden.
+-- Main sekmesindeki Enable Aimbot ile acilir/kapatilir.
+
+--[[
+	Universal Aimbot x Obsidian UI
+	==============================
+	UI layer for the existing aimbot in aimbot.txt. This file contains NO targeting,
+	prediction, raycast, camera or player-loop logic. Every control writes directly
+	into the aimbot's live config tables (Settings / FOVSettings / Prediction /
+	Network / Smoothing / TeamResolver), which the aimbot's own systems consume.
+
+	Load order: run aimbot.txt FIRST (it auto-starts), then run this file.
+	Requires: Obsidian UI Library (loaded below via loadstring).
+
+	Architecture:
+		Obsidian controls -> Aimbot Config -> Targeting / Prediction / Smoothing
+]]
+
+--// Library
+
+local Repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+local Library = loadstring(game:HttpGet(Repo .. "Library.lua"))()
+local SaveManager = loadstring(game:HttpGet(Repo .. "addons/SaveManager.lua"))()
+
+local Options = Library.Options
+local Toggles = Library.Toggles
+
+--// Aimbot accessor (single integration point; never duplicated logic)
+
+local function Aim()
+	local ok, genv = pcall(function() return getgenv() end)
+	if not ok or genv == nil then
+		return nil
+	end
+	return genv.ExunysDeveloperAimbot
+end
+
+local function Notify(text)
+	pcall(function()
+		Library:Notify(text, 3)
+	end)
+	print("[AimbotUI]", text)
+end
+
+--// Window (created first so a missing aimbot still shows guidance)
+
+local Window = Library:CreateWindow({
+	Title = "Universal Aimbot",
+	Footer = "Obsidian UI",
+	Center = true,
+	AutoShow = true,
+})
+
+local Tabs = {
+	Main = Window:AddTab("Main", "user"),
+	Debug = Window:AddTab("Debug", "search"),
+	["UI Settings"] = Window:AddTab("UI Settings", "settings"),
+}
+
+--[[
+
+	Universal Aimbot Module by Exunys © CC0 1.0 Universal (2023)
+
+	https://github.com/Exunys
+
+	UPGRADED (in-place): adaptive targeting layer.
+	PREDICTION V2: latency-driven (ping -> time, velocity -> direction) + EMA velocity,
+	jitter-aware confidence, slow auto-calibration. Legacy paths kept as fallback.
+	- Centralized validation pipeline (single IsValidTarget).
+	- Correct nil-safe Team Check (Team-first, optional TeamColor fallback, neutral handling).
+	- Weighted target scoring (FOV / Distance / Visibility / Health / Priority / Persistence).
+	- Target hysteresis (switch threshold, stickiness, grace period).
+	- Velocity history + acceleration estimate + adaptive prediction + confidence.
+	- Adaptive smoothing (error / distance / velocity driven), no per-frame Tween allocation.
+	- Visibility cache + player cache + performance scheduler (scan at medium rate, aim every frame).
+	- Throttled debug mode, full cleanup, preserved public API.
+
+]]
+
+--// Luraph Macros
+
+if LPH_OBFUSCATED == nil then -- Must wrap in an "if" statement: "The macro 'LPH_NO_VIRTUALIZE' cannot be assigned to. Check if LPH_OBFUSCATED is nil before assigning to macros."
+	LPH_NO_VIRTUALIZE = function(...)
+		return ...
+	end
+end
+
+--// Cache
+
+local game, workspace = game, workspace
+local getrawmetatable, pcall, next, tick, getgenv = getrawmetatable, pcall, next, tick, getgenv
+local Vector2new, Vector3zero, CFramenew, Color3fromRGB, Color3fromHSV, Drawingnew, TweenInfonew = Vector2.new, Vector3.zero, CFrame.new, Color3.fromRGB, Color3.fromHSV, Drawing and Drawing.new, TweenInfo.new
+local mousemoverel, mousemoveabs, tablefind, tableremove, stringlower, stringsub, mathclamp = mousemoverel or (Input and Input.MouseMove), mousemoveabs, table.find, table.remove, string.lower, string.sub, math.clamp
+local mouse1press, mouse1release, taskwait = mouse1press, mouse1release, task.wait
+local mathfloor, mathhuge, mathabs, mathexp, osclock = math.floor, math.huge, math.abs, math.exp, os.clock
+local clonefunction, cloneref = clonefunction or LPH_NO_VIRTUALIZE(function(...)
+	return ...
+end), cloneref or LPH_NO_VIRTUALIZE(function(...)
+	return ...
+end)
+
+--// Boot Diagnostics (print-based; silence via DeveloperSettings.DiagnosticPrints = false)
+
+local function dprint(...)
+	local show = true
+	pcall(function()
+		local g = getgenv()
+		if g ~= nil and g.ExunysDeveloperAimbot ~= nil and g.ExunysDeveloperAimbot.DeveloperSettings ~= nil then
+			if g.ExunysDeveloperAimbot.DeveloperSettings.DiagnosticPrints == false then
+				show = false
+			end
+		end
+	end)
+	if show then
+		print("[Aimbot][Diag]", ...)
+	end
+end
+
+local DrawingAvailable = type(Drawing) == "table" and type(Drawing.new) == "function"
+dprint("Drawing:", DrawingAvailable and "OK" or "MISSING - circles/tracer stubbed, aim logic still runs")
+if not DrawingAvailable then
+	Drawingnew = function(_kind)
+		local stub = {}
+		stub.Remove = function() end
+		return stub
+	end
+end
+
+local GameMetatable = getrawmetatable and getrawmetatable(game) or {
+	-- Auxillary functions - if the executor doesn't support "getrawmetatable".
+
+	__index = LPH_NO_VIRTUALIZE(function(self, Index)
+		return self[Index]
+	end),
+
+	__newindex = LPH_NO_VIRTUALIZE(function(self, Index, Value)
+		self[Index] = Value
+	end)
+}
+
+local __index = GameMetatable.__index
+local __newindex = GameMetatable.__newindex
+
+local getrenderproperty, setrenderproperty = getrenderproperty or __index, setrenderproperty or __newindex
+
+local _GetService = __index(game, "GetService")
+local GetService = function(Service)
+	return cloneref(_GetService(game, Service))
+end
+
+--// Services
+
+local RunService = GetService("RunService")
+local UserInputService = GetService("UserInputService")
+local TweenService = GetService("TweenService")
+local Players = GetService("Players")
+
+--// Service Methods
+
+local LocalPlayer = __index(Players, "LocalPlayer")
+local Camera = __index(workspace, "CurrentCamera")
+
+do
+	local tries = 0
+	while Camera == nil and tries < 100 do
+		taskwait(0.1)
+		tries = tries + 1
+		pcall(function() Camera = __index(workspace, "CurrentCamera") end)
+	end
+end
+dprint("LocalPlayer:", (LocalPlayer ~= nil and __index(LocalPlayer, "Name")) or "NIL")
+dprint("Camera:", Camera ~= nil and "OK" or "NIL")
+dprint("mouse1press/mouse1release:", type(mouse1press), type(mouse1release))
+dprint("mousemoverel/mousemoveabs:", type(mousemoverel), type(mousemoveabs))
+if LocalPlayer == nil then
+	error("[Aimbot] LocalPlayer is nil - run this after spawning (not in Studio command bar).")
+end
+if Camera == nil then
+	error("[Aimbot] CurrentCamera is nil - open a game world first, then re-execute.")
+end
+
+local FindFirstChild, FindFirstChildOfClass = __index(game, "FindFirstChild"), __index(game, "FindFirstChildOfClass")
+local GetDescendants = __index(game, "GetDescendants")
+local WorldToViewportPoint = __index(Camera, "WorldToViewportPoint")
+local GetPartsObscuringTarget = __index(Camera, "GetPartsObscuringTarget")
+local GetMouseLocation = __index(UserInputService, "GetMouseLocation")
+local GetPlayers = __index(Players, "GetPlayers")
+local GetPlayerFromCharacter = __index(Players, "GetPlayerFromCharacter")
+local Mouse = __index(LocalPlayer, "GetMouse")(LocalPlayer)
+local CameraViewportSize = __index(Camera, "ViewportSize")
+
+--// Variables
+
+local RequiredDistance, Required3DDistance, Typing, Running, ServiceConnections, Animation, OriginalSensitivity = 2000, 10000, false, false, {}, nil, nil
+local Connect, Disconnect = __index(game, "DescendantAdded").Connect
+
+do
+	local TemporaryConnection = Connect(__index(game, "DescendantAdded"), function() end)
+	Disconnect = TemporaryConnection.Disconnect
+	Disconnect(TemporaryConnection)
+end
+
+--// Upgrade Caches (scheduler / hysteresis / prediction state)
+
+local PlayerCache, PlayerCacheTime = {}, 0
+local VisibilityCache = {}
+local FriendSet, FriendSetTime, FriendAPIUnavailable = {}, 0, false
+local VelocityState = { Samples = {}, AvgVelocity = Vector3zero, SmoothVel = nil, Acceleration = Vector3zero, Confidence = 0, LastPos = nil, LastTime = 0, Stable = true }
+-- Network stats belong to the connection, NOT the target: never cleared on target change.
+local PingState = { Raw = 0, Smoothed = 0, Min = 0, Max = 0, Jitter = 0, Samples = {}, Quality = "Unknown", Correction = 1, ErrBuf = {}, LastPred = nil, Effective = 0, LastUpdate = 0, LastCalib = 0, Available = false }
+local ScanState = { Time = 0, Best = nil, BestScore = -1, Results = {} }
+local LockMeta = { Since = 0, LastSeen = 0, LastScore = -1 }
+local LastAimData = { SX = 0, SY = 0, PX = 0, PY = 0, PZ = 0, Method = "Camera" }
+local LastBreakdown = { FOV = 0, Distance = 0, Visibility = 0, Health = 0, Priority = 0 }
+local DebugLastPrint = 0
+local TriggerBusy, TriggerLastClick = false, 0
+
+--// Environment
+
+dprint("getgenv:", type(getgenv), "getrawmetatable:", type(getrawmetatable))
+if type(getgenv) ~= "function" then
+	error("[Aimbot] getgenv() is missing - this script needs an executor with getgenv support.")
+end
+
+-- Eski bir örnek zaten çalışıyorsa (tekrar çalıştırma), önce onu temizleyebilelim.
+local PreviousInstance = getgenv().ExunysDeveloperAimbot
+
+getgenv().ExunysDeveloperAimbot = {
+	DeveloperSettings = {
+		UpdateMode = "RenderStepped",
+		TeamCheckOption = "TeamColor",
+		RainbowSpeed = 1, -- Bigger = Slower
+		DisableWarnings = false,
+		DiagnosticPrints = true, -- Boot/step logs via print. Set false to silence.
+		AutoStart = true -- Load() otomatik çağrılır; dosyayı çalıştırman yeterli.
+	},
+
+	Settings = {
+		Enabled = true,
+
+		TeamCheck = true, -- Same-team players are never targeted. Nil-safe (see IsTeammate).
+		UseTeamColorFallback = true, -- If Team objects are unusable, fall back to TeamColor comparison.
+		IncludeNeutralPlayers = true, -- Players with no team are valid targets when true.
+		FriendCheck = true, -- Roblox friends are skipped (one-time async friend list, cached).
+		AliveCheck = true,
+		WallCheck = true, -- Visibility gate (cached raycasts, see Performance.VisibilityTTL).
+
+		OffsetToMoveDirection = false,
+		OffsetIncrement = 15,
+
+		Sensitivity = 0, -- Base lock-on time (seconds). 0 = instant. Still respected; adaptive layer scales it.
+		Sensitivity2 = 1, -- mousemoverel Sensitivity
+
+		LockMode = 1, -- Legacy key, kept for config compat. Consolidated into AimbotMethod below.
+		AimbotMethod = "Camera", -- Camera | Mouse. Master aim-output switch, live, no restart.
+		                         -- Camera = CFrame aim (legacy LockMode 1 path, smoothed + adaptive).
+		                         -- Mouse = relative-cursor aim (legacy LockMode 2 path, now smoothed).
+		                         -- Only the final output stage differs; pipeline is fully shared.
+		LockPart = "Head", -- Used when PartMode = "Static".
+		PartMode = "Static", -- Static | PriorityList | ClosestToCursor | ClosestVisible
+		TargetParts = { "Head", "UpperTorso", "LowerTorso", "Torso", "HumanoidRootPart" },
+		MaxDistance = 1000, -- World studs. Beyond this, targets are rejected before scoring.
+		StrictVisibility = true, -- true = obstructed targets rejected; false = only scored lower.
+
+		PriorityMode = "Score", -- Score | ClosestToCursor | ClosestDistance | LowestHealth | Priority
+		SwitchThreshold = 0.12, -- New target must beat current by this much to steal the lock.
+		TargetStickiness = 0.5, -- Persistence bonus (0-1) added to the locked target's score.
+		TargetGracePeriod = 0.1, -- Grace for LIVE targets only (brief occlusion/FOV exit). 0 = off. Conservative by design.
+		LockRetentionRadius = 30, -- px floor for lock retention. The live retention radius is
+		                          -- acquisition-anchored (original Exunys semantics) but NEVER the full
+		                          -- acquisition FOV by default. See LockMeta.RetainRadius.
+		PositionSanityCheck = true, -- Secondary net: impossible single-frame jumps invalidate (relative, no world-Y hardcode).
+		MaxTargetDisplacement = 400, -- studs/sec allowance (+5 base). Only impossible movement trips it.
+		MaxVerticalDisplacement = 300, -- studs/sec vertical allowance (+5 base).
+
+		TriggerKey = Enum.UserInputType.MouseButton2,
+		Toggle = false
+	},
+
+	Scoring = {
+		FOVWeight = 3,
+		DistanceWeight = 1,
+		VisibilityWeight = 1.5,
+		HealthWeight = 0, -- 0 = off. Raise to prefer low-health targets.
+		PriorityWeight = 2,
+		PersistenceWeight = 1
+	},
+
+	Prediction = {
+		Adaptive = true,
+		Base = 0.12, -- Legacy fixed prediction time. Used when PingPrediction is OFF/unavailable, or when Adaptive = false.
+		Min = 0,
+		Max = 0.3,
+		VelocityInfluence = 0.35, -- Legacy velocity-based path only.
+		DistanceInfluence = 0.25, -- Legacy velocity-based path only.
+		AccelerationInfluence = 0.15, -- Legacy velocity-based path only.
+		VelocitySmoothing = true, -- EMA-smoothed velocity feeds prediction (less noisy than raw average).
+		VelocityAlpha = 0.35,
+		ConfidenceStrength = 0.6 -- Prediction scales with (1-strength) + strength*confidence.
+	},
+
+	Network = {
+		PingPrediction = true, -- Master switch. OFF = legacy velocity-only prediction paths.
+		PingMultiplier = 1.0, -- User tune for effective latency (0.5 / 0.75 / 1.0 / 1.25 / 1.5 ...).
+		PingSmoothing = true, -- EMA instead of raw ping. False = follow raw ping (not recommended).
+		PingAlpha = 0.1, -- EMA alpha. Lower = slower, more stable.
+		PingHistory = 20, -- Bounded rolling buffer size (min/max/jitter source).
+		PingUpdateRate = 0.25, -- Ping sampling interval (seconds). Low frequency by design.
+		MinLatency = 0.02, -- Clamp: one-way latency floor (seconds).
+		MaxLatency = 0.3, -- Clamp: one-way latency ceiling (seconds).
+		JitterCompensation = true, -- High jitter -> lower confidence + calmer prediction.
+		JitterStrength = 0.5,
+		DistanceCompensation = true, -- Far targets get a small extra lead (latency stays primary).
+		DistanceStrength = 1.0,
+		AutoCalibration = true, -- Slow self-correction of overshoot/undershoot bias.
+		CalibrationStrength = 1.0,
+		CalibrationRate = 0.05, -- Learning rate (kept slow on purpose).
+		CalibrationMin = 0.5, -- Hard clamp on the auto correction multiplier.
+		CalibrationMax = 1.5,
+		ErrorSamples = 10 -- Rolling error buffer size.
+	},
+
+	Smoothing = {
+		Adaptive = true,
+		Min = 0.08, -- Minimum lerp factor per frame.
+		Max = 0.9, -- Maximum lerp factor per frame.
+		ErrorInfluence = 0.6,
+		DistanceInfluence = 0.2,
+		VelocityInfluence = 0.3,
+		StabilityInfluence = 0.4
+	},
+
+	Performance = {
+		TargetScanRate = 0.12, -- Full candidate scan interval (seconds).
+		VisibilityTTL = 0.15, -- Visibility cache lifetime (seconds).
+		VelocitySamples = 5, -- Rolling velocity history length.
+		PlayerReconcile = 2 -- Player cache reconcile interval (seconds).
+	},
+
+	Debugger = {
+		Enabled = false,
+		Rate = 0.5 -- Throttled debug print interval (seconds). Never spams per frame.
+	},
+
+	PriorityPlayers = {}, -- Array of exact player Names that receive a priority score multiplier.
+
+	TeamResolver = {
+		Mode = "Auto", -- Auto | Native | Attributes | Values | Tags | GameAdapter | Manual | Disabled
+		ManualAttribute = "", -- e.g. "Faction": player:GetAttribute("Faction") becomes authoritative.
+		ManualValuePath = "", -- e.g. "Data.Team" (from Player) or "Character.Stats.Side" (from character).
+		UnknownBehavior = "Ignore", -- UNKNOWN target: "Ignore" (strict, skip) or "Target" (permissive).
+		NormalizeCase = true, -- "Red" == "red". Disable if case carries meaning in your game.
+		IgnoreSpectators = true, -- Spectator/Lobby/Waiting states are never treated as enemies.
+		SpectatorNames = { "Spectator", "Spectators", "Lobby", "Waiting", "Dead", "Observer", "Observers", "AFK", "Queue" },
+		UseVisualDetection = false, -- Unreliable by design; resolver returns Unknown for visuals.
+		ExperimentalDetection = false, -- Billboard/OCR-style sources. Never primary; off by default.
+		ConfidenceThreshold = 0.6, -- Auto-detected sources below this are not used.
+		CacheTTL = 1.0, -- Per-player team cache lifetime (seconds).
+		ReanalyzeRate = 5.0 -- Cross-player consistency re-analysis interval (seconds).
+	},
+
+	-- Optional game-specific adapter. Shape:
+	--   GameAdapter = { GetTeam = function(player) return { TeamId = "Red", TeamName = "Red", TeamColor = Color3.fromRGB(255,0,0) } end }
+	-- Return nil / {} when unknown. Never hardcode game paths in the generic resolver.
+	GameAdapter = nil,
+
+	Triggerbot = {
+		Enabled = false,
+
+		TeamCheck = true,
+		AliveCheck = true,
+		AimLockedCheck = false,
+
+		Delay = 0, -- Time it takes for the trigger bot to react / click (seconds).
+		Cooldown = 0.25 -- Minimum seconds between clicks (debounce; prevents click storms).
+	},
+
+	ClosestPlayerTracer = {
+		Enabled = true,
+		Position = 3, -- 1 = Bottom; 2 = Center; 3 = Mouse
+
+		Transparency = 0.5,
+		Thickness = 1,
+
+		RainbowColor = false,
+		Color = Color3fromRGB(150, 150, 255)
+	},
+
+	FOVSettings = {
+		Enabled = true,
+		Visible = true,
+
+		Radius = 180,
+		NumSides = 60,
+
+		Thickness = 1,
+		Transparency = 1,
+		Filled = false,
+
+		DynamicFOV = false, -- Closer target = smaller effective FOV, farther = larger (clamped).
+		DynamicMin = 0.7,
+		DynamicMax = 1.3,
+
+		RainbowColor = false,
+		RainbowOutlineColor = false,
+		Color = Color3fromRGB(255, 255, 255),
+		OutlineColor = Color3fromRGB(0, 0, 0),
+		LockedColor = Color3fromRGB(255, 150, 150),
+		ShowLockRadius = false, -- Second visual ring for the SMALL lock-retention radius (debug aid).
+		LockRadiusColor = Color3fromRGB(255, 150, 150)
+	},
+
+	Blacklisted = {},
+	FOVCircleOutline = Drawingnew("Circle"),
+	FOVCircle = Drawingnew("Circle"),
+	LockRadiusCircle = Drawingnew("Circle"),
+	Tracer = Drawingnew("Line")
+}
+
+local Environment, _warn = getgenv().ExunysDeveloperAimbot, clonefunction(warn); warn = function(...)
+	return not Environment.DeveloperSettings.DisableWarnings and _warn(...)
+end
+
+repeat
+	taskwait(0)
+until Environment and Environment.FOVCircle and Environment.FOVCircleOutline
+
+setrenderproperty(Environment.FOVCircle, "Visible", false)
+setrenderproperty(Environment.FOVCircleOutline, "Visible", false)
+setrenderproperty(Environment.LockRadiusCircle, "Visible", false)
+
+--// Core Functions
+
+local FixUsername = LPH_NO_VIRTUALIZE(function(String)
+	for _, Value in next, GetPlayers(Players) do
+		local Name = __index(Value, "Name")
+
+		if stringsub(stringlower(Name), 1, #String) == stringlower(String) then
+			return Name
+		end
+	end
+end)
+
+local GetRainbowColor = LPH_NO_VIRTUALIZE(function()
+	local RainbowSpeed = Environment.DeveloperSettings.RainbowSpeed
+
+	return Color3fromHSV(tick() % RainbowSpeed / RainbowSpeed, 1, 1)
+end)
+
+local ConvertVector = LPH_NO_VIRTUALIZE(function(Vector)
+	return Vector2new(Vector.X, Vector.Y)
+end)
+
+-- Universal Team Resolver (multi-source). Native Roblox Teams are preserved and
+-- checked first; custom sources engage only when native data is LowInformation
+-- (everyone same/neutral) or when the user forces a mode. Never invents a team:
+-- unknown sources yield Known=false, and strict mode ignores unknown targets.
+-- Only IsSameTeam() implements team logic; the rest of the aimbot never does.
+local TEAM_ATTR_NAMES = { Team = true, TeamId = true, TeamID = true, TeamName = true, Faction = true, FactionId = true, FactionID = true, FactionName = true, Side = true, SideId = true, SideID = true, Squad = true, SquadId = true, SquadID = true, Group = true, GroupId = true, GroupID = true, Alliance = true, AllianceId = true, AllianceID = true, Allegiance = true, Camp = true, CampId = true, CampID = true }
+local ROLE_DENY = { Role = true, RoleName = true, Class = true, Job = true, Kit = true, Loadout = true, Weapon = true, Perk = true, Character = true, Skin = true, Title = true }
+local STAT_DENY = { Level = true, Kills = true, Deaths = true, Cash = true, Money = true, Coins = true, Health = true, MaxHealth = true, Speed = true, WalkSpeed = true, JumpPower = true, Score = true, Points = true, XP = true, Experience = true, Streak = true, Damage = true, Stage = true, Wins = true, Losses = true, PlayTime = true, Age = true, Value = true }
+
+local TeamCache = {}
+local TeamHooked = {}
+local TeamRanking = { Attr = {}, Value = {}, Tag = {}, NativeDiverse = false, Time = 0 }
+
+local TeamCS = nil
+pcall(function() TeamCS = GetService("CollectionService") end)
+
+local function NormTeamId(v, cfg)
+	local t = type(v)
+	if t == "number" then
+		return "N:" .. tostring(v)
+	end
+	if t == "string" then
+		if cfg == nil or cfg.NormalizeCase ~= false then
+			v = stringlower(v)
+		end
+		return "S:" .. v
+	end
+	if t == "boolean" then
+		return "B:" .. tostring(v)
+	end
+	if typeof(v) == "BrickColor" then
+		return "C:" .. v.Name
+	end
+	if typeof(v) == "Color3" then
+		return "C:" .. tostring(mathfloor(v.R * 255)) .. "," .. tostring(mathfloor(v.G * 255)) .. "," .. tostring(mathfloor(v.B * 255))
+	end
+	if typeof(v) == "Instance" then
+		local n = "?"
+		pcall(function() n = v.Name end)
+		return "I:" .. tostring(n)
+	end
+	return nil
+end
+
+local function IsSpectatorName(name, cfg)
+	if type(name) ~= "string" then
+		return false
+	end
+	local needle = stringlower(name)
+	local list = (cfg ~= nil and cfg.SpectatorNames) or { "Spectator", "Lobby", "Waiting" }
+	for _, s in next, list do
+		if type(s) == "string" and stringlower(s) == needle then
+			return true
+		end
+	end
+	return false
+end
+
+local function ReadAttr(inst, name)
+	if inst == nil or type(name) ~= "string" or #name < 1 then
+		return nil
+	end
+	local ok, val = pcall(function() return __index(inst, "GetAttribute")(inst, name) end)
+	if ok then
+		return val
+	end
+	return nil
+end
+
+local function ReadAttrBoth(player, name)
+	local v = ReadAttr(player, name)
+	if v ~= nil then
+		return v
+	end
+	local okC, char = pcall(function() return __index(player, "Character") end)
+	if okC and char ~= nil then
+		return ReadAttr(char, name)
+	end
+	return nil
+end
+
+local function ReadValuePath(rootPlayer, path)
+	if type(path) ~= "string" or #path < 1 then
+		return nil
+	end
+	local okC, char = pcall(function() return __index(rootPlayer, "Character") end)
+	local node = rootPlayer
+	for part in string.gmatch(path, "[^.]+") do
+		if part == "Character" and node == rootPlayer then
+			node = (okC and char) or nil
+		else
+			if node == nil then
+				return nil
+			end
+			local okF, child = pcall(function() return FindFirstChild(node, part) end)
+			if not okF or child == nil then
+				return nil
+			end
+			node = child
+		end
+	end
+	if node == nil then
+		return nil
+	end
+	local okV, val = pcall(function()
+		if __index(node, "IsA")(node, "ValueBase") then
+			return __index(node, "Value")
+		end
+		return nil
+	end)
+	if okV then
+		return val
+	end
+	return nil
+end
+
+local function ReadTags(player)
+	local out = {}
+	if TeamCS == nil then
+		return out
+	end
+	local function grab(inst)
+		if inst == nil then
+			return
+		end
+		local okT, tags = pcall(function() return __index(TeamCS, "GetTags")(TeamCS, inst) end)
+		if okT and type(tags) == "table" then
+			for _, t in next, tags do
+				out[#out + 1] = t
+			end
+		end
+	end
+	grab(player)
+	local okC, char = pcall(function() return __index(player, "Character") end)
+	if okC then
+		grab(char)
+	end
+	return out
+end
+
+local function TagTeamId(tag)
+	if type(tag) ~= "string" then
+		return nil
+	end
+	for _, pre in next, { "Team_", "Faction_", "Side_", "Squad_" } do
+		if stringsub(tag, 1, #pre) == pre then
+			local suf = stringsub(tag, #pre + 1)
+			if #suf > 0 then
+				return "S:" .. stringlower(suf), 0.75
+			end
+		end
+	end
+	if tag == "Enemy" then
+		return "__enemy__", 0.7
+	end
+	if tag == "Ally" then
+		return "__ally__", 0.7
+	end
+	return nil
+end
+
+local function RankConfidence(distinct, coverage)
+	local base = 0.15
+	if distinct >= 2 and distinct <= 4 then
+		base = 0.95
+	elseif distinct <= 8 then
+		base = 0.8
+	elseif distinct > 8 then
+		base = 0.4
+	end
+	return base * coverage
+end
+
+-- Cross-player consistency analysis (slow gate): an attribute/value/tag is only
+-- trusted as a team source when its values actually separate players.
+local AnalyzeSources = LPH_NO_VIRTUALIZE(function(Force)
+	local cfg = Environment.TeamResolver
+	local now = tick()
+	if not Force and (now - TeamRanking.Time) < (cfg.ReanalyzeRate or 5) then
+		return
+	end
+	TeamRanking = { Attr = {}, Value = {}, Tag = {}, NativeDiverse = false, Time = now }
+	local players = {}
+	for _, p in next, GetPlayers(Players) do
+		players[#players + 1] = p
+	end
+	if #players < 1 then
+		return
+	end
+
+	local attrVals, attrCov = {}, {}
+	local valVals, valCov = {}, {}
+	local tagVals, tagCov = {}, {}
+	local nativeSet, nativeCount = {}, 0
+
+	local function tally(t, cov, key, normId)
+		if normId == nil then
+			return
+		end
+		if t[key] == nil then
+			t[key] = {}
+		end
+		t[key][normId] = (t[key][normId] or 0) + 1
+		cov[key] = (cov[key] or 0) + 1
+	end
+
+	for _, p in next, players do
+		-- native diversity
+		local okT, team = pcall(function() return __index(p, "Team") end)
+		if okT and team ~= nil then
+			local okN, tname = pcall(function() return __index(team, "Name") end)
+			if okN and tname ~= nil then
+				if nativeSet[tname] == nil then
+					nativeSet[tname] = true
+					nativeCount = nativeCount + 1
+				end
+			end
+		end
+		-- attributes (player + character)
+		local seen = {}
+		local function scanAttrs(inst)
+			if inst == nil then
+				return
+			end
+			local okA, attrs = pcall(function() return __index(inst, "GetAttributes")(inst) end)
+			if not okA or type(attrs) ~= "table" then
+				return
+			end
+			for k, v in next, attrs do
+				if TEAM_ATTR_NAMES[k] and not ROLE_DENY[k] and not STAT_DENY[k] and seen[k] == nil then
+					seen[k] = true
+					tally(attrVals, attrCov, k, NormTeamId(v, cfg))
+				end
+			end
+		end
+		scanAttrs(p)
+		local okC, char = pcall(function() return __index(p, "Character") end)
+		if okC then
+			scanAttrs(char)
+		end
+		-- value objects: direct children + one-level Data-style containers
+		local function scanValues(inst, prefix)
+			if inst == nil then
+				return
+			end
+			local okK, kids = pcall(function() return __index(inst, "GetChildren")(inst) end)
+			if not okK or type(kids) ~= "table" then
+				return
+			end
+			for _, child in next, kids do
+				local okN, cname = pcall(function() return __index(child, "Name") end)
+				if okN and type(cname) == "string" then
+					local okV, isV = pcall(function() return __index(child, "IsA")(child, "ValueBase") end)
+					if okV and isV then
+						if TEAM_ATTR_NAMES[cname] and not ROLE_DENY[cname] and not STAT_DENY[cname] then
+							local okVal, vv = pcall(function() return __index(child, "Value") end)
+							if okVal then
+								tally(valVals, valCov, prefix .. cname, NormTeamId(vv, cfg))
+							end
+						end
+					elseif prefix == "" and (cname == "Data" or cname == "PlayerData" or cname == "Stats" or cname == "leaderstats" or cname == "Values") then
+						scanValues(child, cname .. ".")
+					end
+				end
+			end
+		end
+		scanValues(p, "")
+		local okC2, char2 = pcall(function() return __index(p, "Character") end)
+		if okC2 and char2 ~= nil then
+			scanValues(char2, "Character.")
+		end
+		-- tags
+		local seenPre = {}
+		for _, tag in next, ReadTags(p) do
+			for _, pre in next, { "Team_", "Faction_", "Side_", "Squad_" } do
+				if type(tag) == "string" and stringsub(tag, 1, #pre) == pre then
+					local suf = stringsub(tag, #pre + 1)
+					if #suf > 0 and seenPre[pre] == nil then
+						seenPre[pre] = true
+						tally(tagVals, tagCov, pre, "S:" .. stringlower(suf))
+					end
+				end
+			end
+		end
+	end
+
+	TeamRanking.NativeDiverse = nativeCount > 1
+	local function rankInto(t, cov, dest)
+		for key, set in next, t do
+			local distinct = 0
+			for _ in next, set do
+				distinct = distinct + 1
+			end
+			local coverage = (cov[key] or 0) / #players
+			dest[#dest + 1] = { Key = key, Conf = RankConfidence(distinct, coverage), Distinct = distinct }
+		end
+		table.sort(dest, function(a, b) return a.Conf > b.Conf end)
+	end
+	rankInto(attrVals, attrCov, TeamRanking.Attr)
+	rankInto(valVals, valCov, TeamRanking.Value)
+	rankInto(tagVals, tagCov, TeamRanking.Tag)
+end)
+
+local function ClearTeamCache(Player)
+	local okU, uid = pcall(function() return __index(Player, "UserId") end)
+	if okU and uid ~= nil then
+		TeamCache[uid] = nil
+	end
+end
+
+-- One-time invalidation hooks per player (native team / neutral / attributes).
+local HookTeamInvalidation = LPH_NO_VIRTUALIZE(function(Player)
+	local okU, uid = pcall(function() return __index(Player, "UserId") end)
+	if not okU or uid == nil or TeamHooked[uid] then
+		return
+	end
+	TeamHooked[uid] = true
+	local function clearIt()
+		TeamCache[uid] = nil
+	end
+	pcall(function()
+		Connect(__index(Player, "GetPropertyChangedSignal")(Player, "Team"), clearIt)
+	end)
+	pcall(function()
+		Connect(__index(Player, "GetPropertyChangedSignal")(Player, "TeamColor"), clearIt)
+	end)
+	pcall(function()
+		Connect(__index(Player, "GetPropertyChangedSignal")(Player, "Neutral"), clearIt)
+	end)
+	pcall(function()
+		Connect(__index(Player, "AttributeChanged"), LPH_NO_VIRTUALIZE(function() clearIt() end))
+	end)
+end)
+
+local function CustomSourcesExist()
+	local adapter = Environment.GameAdapter
+	if type(adapter) == "table" and type(adapter.GetTeam) == "function" then
+		return true
+	end
+	local cfg = Environment.TeamResolver
+	if (cfg.ManualAttribute ~= nil and cfg.ManualAttribute ~= "") or (cfg.ManualValuePath ~= nil and cfg.ManualValuePath ~= "") then
+		return true
+	end
+	AnalyzeSources(false)
+	local th = cfg.ConfidenceThreshold or 0.6
+	if #TeamRanking.Attr > 0 and TeamRanking.Attr[1].Conf >= th then
+		return true
+	end
+	if #TeamRanking.Value > 0 and TeamRanking.Value[1].Conf >= th then
+		return true
+	end
+	if #TeamRanking.Tag > 0 and TeamRanking.Tag[1].Conf >= th then
+		return true
+	end
+	return false
+end
+
+-- Central resolver. Returns {TeamId, TeamName, TeamColor, Source, Confidence, Known}.
+local ResolveTeamInfo = LPH_NO_VIRTUALIZE(function(Player)
+	HookTeamInvalidation(Player)
+	local cfg = Environment.TeamResolver
+	local now = tick()
+	local okU, uid = pcall(function() return __index(Player, "UserId") end)
+	local ckey = (okU and uid) or nil
+	if ckey ~= nil then
+		local hit = TeamCache[ckey]
+		if hit ~= nil and (now - (hit.T or 0)) < (cfg.CacheTTL or 1) then
+			return hit
+		end
+	end
+	local info = { Known = false, Source = "Unknown", Confidence = 0, TeamId = nil, TeamName = nil, TeamColor = nil, T = now }
+	local function commit()
+		if ckey ~= nil then
+			TeamCache[ckey] = info
+		end
+		return info
+	end
+	local mode = cfg.Mode or "Auto"
+	if mode == "Disabled" then
+		return commit()
+	end
+
+	-- 1. Explicit game adapter (highest priority).
+	local adapter = Environment.GameAdapter
+	if (mode == "Auto" or mode == "GameAdapter") and type(adapter) == "table" and type(adapter.GetTeam) == "function" then
+		local okA, res = pcall(function() return adapter:GetTeam(Player) end)
+		if okA and type(res) == "table" and res.TeamId ~= nil and NormTeamId(res.TeamId, cfg) ~= nil then
+			info.Known = true
+			info.Source = "GameAdapter"
+			info.Confidence = 1.0
+			info.TeamId = NormTeamId(res.TeamId, cfg)
+			info.TeamName = res.TeamName or res.TeamId
+			info.TeamColor = res.TeamColor
+			return commit()
+		end
+		if mode == "GameAdapter" then
+			return commit()
+		end
+	end
+
+	-- 2. Explicit user-configured source.
+	if cfg.ManualAttribute ~= nil and cfg.ManualAttribute ~= "" then
+		local v = ReadAttrBoth(Player, cfg.ManualAttribute)
+		local nid = NormTeamId(v, cfg)
+		if v ~= nil and nid ~= nil then
+			info.Known = true
+			info.Source = "Manual:" .. cfg.ManualAttribute
+			info.Confidence = 0.98
+			info.TeamId = nid
+			info.TeamName = v
+			return commit()
+		end
+	end
+	if cfg.ManualValuePath ~= nil and cfg.ManualValuePath ~= "" then
+		local v = ReadValuePath(Player, cfg.ManualValuePath)
+		local nid = NormTeamId(v, cfg)
+		if v ~= nil and nid ~= nil then
+			info.Known = true
+			info.Source = "ManualPath:" .. cfg.ManualValuePath
+			info.Confidence = 0.98
+			info.TeamId = nid
+			info.TeamName = v
+			return commit()
+		end
+	end
+	if mode == "Manual" then
+		return commit()
+	end
+
+	-- 3. Native Roblox Team (authoritative ONLY when meaningful).
+	if mode == "Auto" or mode == "Native" then
+		local okT, team = pcall(function() return __index(Player, "Team") end)
+		local okN, neutral = pcall(function() return __index(Player, "Neutral") end)
+		if okN and neutral == true then
+			team = nil
+		end
+		local okC, tcolor = pcall(function() return __index(Player, "TeamColor") end)
+		if mode == "Native" then
+			if okT and team ~= nil then
+				local okTN, tname = pcall(function() return __index(team, "Name") end)
+				if okTN and tname ~= nil then
+					info.Known = true
+					info.Source = "Native"
+					info.Confidence = 1.0
+					info.TeamId = NormTeamId(tname, cfg)
+					info.TeamName = tname
+					info.TeamColor = okC and tcolor or nil
+				end
+			elseif okC and tcolor ~= nil then
+				info.Known = true
+				info.Source = "NativeColor"
+				info.Confidence = 0.9
+				info.TeamId = NormTeamId(tcolor, cfg)
+				info.TeamName = tcolor.Name
+				info.TeamColor = tcolor
+			end
+			return commit()
+		end
+		AnalyzeSources(false)
+		if TeamRanking.NativeDiverse then
+			if okT and team ~= nil then
+				local okTN, tname = pcall(function() return __index(team, "Name") end)
+				if okTN and tname ~= nil then
+					info.Known = true
+					info.Source = "Native"
+					info.Confidence = 1.0
+					info.TeamId = NormTeamId(tname, cfg)
+					info.TeamName = tname
+					info.TeamColor = okC and tcolor or nil
+					return commit()
+				end
+			end
+		end
+		-- else: LowInformation -> keep investigating custom sources.
+	end
+
+	AnalyzeSources(false)
+	local th = cfg.ConfidenceThreshold or 0.6
+	local function useKind(kind, list)
+		if (mode == "Auto" or mode == kind) and #list > 0 and list[1].Conf >= th then
+			return list[1]
+		end
+		return nil
+	end
+	local wantAttr = (mode == "Auto" or mode == "Attributes") and useKind("Attributes", TeamRanking.Attr) or nil
+	if wantAttr ~= nil then
+		local v = ReadAttrBoth(Player, wantAttr.Key)
+		local nid = NormTeamId(v, cfg)
+		if v ~= nil and nid ~= nil then
+			info.Known = true
+			info.Source = "Attribute:" .. wantAttr.Key
+			info.Confidence = mathclamp(wantAttr.Conf, 0, 0.95)
+			info.TeamId = nid
+			info.TeamName = v
+			return commit()
+		end
+	end
+	local wantVal = (mode == "Auto" or mode == "Values") and useKind("Values", TeamRanking.Value) or nil
+	if wantVal ~= nil then
+		local rel = wantVal.Key
+		local v = nil
+		if stringsub(rel, 1, 10) == "Character." then
+			local okC, char = pcall(function() return __index(Player, "Character") end)
+			if okC and char ~= nil then
+				v = ReadValuePath(Player, rel)
+			end
+		else
+			v = ReadValuePath(Player, rel)
+		end
+		local nid = NormTeamId(v, cfg)
+		if v ~= nil and nid ~= nil then
+			info.Known = true
+			info.Source = "Value:" .. rel
+			info.Confidence = mathclamp(wantVal.Conf, 0, 0.9)
+			info.TeamId = nid
+			info.TeamName = v
+			return commit()
+		end
+	end
+	if mode == "Auto" or mode == "Tags" then
+		local best = useKind("Tags", TeamRanking.Tag)
+		for _, tag in next, ReadTags(Player) do
+			local tid, tconf = TagTeamId(tag)
+			if tid ~= nil then
+				if best ~= nil then
+					for _, pre in next, { "Team_", "Faction_", "Side_", "Squad_" } do
+						if stringsub(tag, 1, #pre) == pre and best.Key == pre then
+							info.Known = true
+							info.Source = "Tag:" .. tag
+							info.Confidence = mathclamp(best.Conf, 0, 0.8)
+							info.TeamId = tid
+							info.TeamName = tag
+							return commit()
+						end
+					end
+				end
+				if tag == "Enemy" or tag == "Ally" then
+					info.Known = true
+					info.Source = "Tag:" .. tag
+					info.Confidence = tconf
+					info.TeamId = tid
+					info.TeamName = tag
+					return commit()
+				end
+			end
+		end
+	end
+	return commit()
+end)
+
+-- Legacy native-only comparison (exact old semantics). Used when the resolver has
+-- no knowledge AND no custom sources exist anywhere (pure native/neutral game).
+local LegacyPairTeammates = LPH_NO_VIRTUALIZE(function(A, B)
+	local Settings = Environment.Settings
+	local TA, TB
+	pcall(function() TA = __index(A, "Team") end)
+	pcall(function() TB = __index(B, "Team") end)
+	if TA ~= nil and TB ~= nil then
+		return TA == TB
+	end
+	if Settings.UseTeamColorFallback then
+		local CA, CB
+		pcall(function() CA = __index(A, "TeamColor") end)
+		pcall(function() CB = __index(B, "TeamColor") end)
+		if CA ~= nil and CB ~= nil then
+			return CA == CB
+		end
+	end
+	return false
+end)
+
+-- THE single team-relationship function. Everything else delegates here.
+local IsSameTeam = LPH_NO_VIRTUALIZE(function(A, B)
+	if A == B then
+		return true
+	end
+	local cfg = Environment.TeamResolver
+	local infoA = ResolveTeamInfo(A)
+	local infoB = ResolveTeamInfo(B)
+	-- Spectator / lobby / waiting states are never enemies.
+	if cfg.IgnoreSpectators ~= false then
+		if (type(infoA.TeamName) == "string" and IsSpectatorName(infoA.TeamName, cfg)) or (type(infoB.TeamName) == "string" and IsSpectatorName(infoB.TeamName, cfg)) then
+			return true
+		end
+	end
+	-- Same compatible source: compare normalized identifiers.
+	if infoA.Known and infoB.Known and infoA.Source == infoB.Source then
+		if infoA.TeamId == "__enemy__" or infoB.TeamId == "__enemy__" then
+			return infoA.TeamId == "__ally__" and infoB.TeamId == "__ally__"
+		end
+		return infoA.TeamId == infoB.TeamId
+	end
+	-- Incomplete knowledge: legacy path only when NO custom source exists at all.
+	if not CustomSourcesExist() then
+		return LegacyPairTeammates(A, B)
+	end
+	-- Strict by default: unknown custom-team target is skipped.
+	if cfg.UnknownBehavior == "Target" then
+		return false
+	end
+	return true
+end)
+
+-- Team Check (nil-safe). Thin wrapper now; all logic lives in IsSameTeam.
+local IsTeammate = LPH_NO_VIRTUALIZE(function(Player)
+	local Settings = Environment.Settings
+
+	if Player == LocalPlayer then
+		return true
+	end
+
+	if not Settings.TeamCheck then
+		return false
+	end
+
+	return IsSameTeam(LocalPlayer, Player)
+end)
+
+local IsNeutral = LPH_NO_VIRTUALIZE(function(Player)
+	local Team
+	pcall(function() Team = __index(Player, "Team") end)
+	return Team == nil
+end)
+
+-- Friend list: one-time async build via the real Friends API, refreshed slowly.
+local RefreshFriends = LPH_NO_VIRTUALIZE(function()
+	if FriendAPIUnavailable then
+		return
+	end
+	local ok, err = pcall(function()
+		local pages = __index(Players, "GetFriendsAsync")(Players, __index(LocalPlayer, "UserId"))
+		while true do
+			local items = pages:GetCurrentPage()
+			for _, item in next, items do
+				if item and item.Id then
+					FriendSet[item.Id] = true
+				end
+			end
+			if pages.IsFinished then
+				break
+			end
+			pages:AdvanceToNextPageAsync()
+		end
+	end)
+	if not ok then
+		FriendAPIUnavailable = true
+		warn("Aimbot: Friends API unavailable, Friend Check passes through (" .. tostring(err) .. ")")
+	end
+	FriendSetTime = tick()
+end)
+
+local IsFriend = LPH_NO_VIRTUALIZE(function(Player)
+	if not Environment.Settings.FriendCheck then
+		return false
+	end
+	if Player == LocalPlayer then
+		return false
+	end
+	if FriendAPIUnavailable then
+		return false
+	end
+	local id
+	pcall(function() id = __index(Player, "UserId") end)
+	return id ~= nil and FriendSet[id] == true
+end)
+
+-- Single character lookup reused by validation/scoring (no repeated hierarchy walks).
+local GetCharacterData = LPH_NO_VIRTUALIZE(function(Player)
+	local Character
+	pcall(function() Character = __index(Player, "Character") end)
+	if Character == nil then
+		return nil
+	end
+	local Humanoid = FindFirstChildOfClass(Character, "Humanoid")
+	local RootPart = FindFirstChild(Character, "HumanoidRootPart")
+	if Humanoid == nil or RootPart == nil then
+		return nil
+	end
+	return Character, Humanoid, RootPart
+end)
+
+-- Target-part resolution per PartMode. Never errors on missing parts.
+local ResolveAimPart = LPH_NO_VIRTUALIZE(function(Character)
+	local Settings = Environment.Settings
+	local Mode = Settings.PartMode or "Static"
+
+	if Mode == "PriorityList" then
+		local list = Settings.TargetParts
+		if type(list) == "table" then
+			for _, PartName in next, list do
+				local part = FindFirstChild(Character, PartName)
+				if part ~= nil then
+					local okPos, pos = pcall(function() return __index(part, "Position") end)
+					if okPos and pos ~= nil then
+						return part, pos
+					end
+				end
+			end
+		end
+		return nil, nil
+	end
+
+	if Mode == "ClosestToCursor" or Mode == "ClosestVisible" then
+		local list = Settings.TargetParts
+		local bestPart, bestPos, bestDist = nil, nil, mathhuge
+		local mousePos = GetMouseLocation(UserInputService)
+		if type(list) == "table" then
+			for _, PartName in next, list do
+				local part = FindFirstChild(Character, PartName)
+				if part ~= nil then
+					local okPos, pos = pcall(function() return __index(part, "Position") end)
+					if okPos and pos ~= nil then
+						if Mode == "ClosestVisible" then
+							local vis = CheckVisibilityCached(pos, Character)
+							if not vis then
+								-- skip obstructed parts in this mode
+							else
+								local okV, vec, onScreen = pcall(function() return WorldToViewportPoint(Camera, pos) end)
+								if okV and onScreen then
+									local d = (mousePos - ConvertVector(vec)).Magnitude
+									if d < bestDist then
+										bestPart, bestPos, bestDist = part, pos, d
+									end
+								end
+							end
+						else
+							local okV, vec, onScreen = pcall(function() return WorldToViewportPoint(Camera, pos) end)
+							if okV and onScreen then
+								local d = (mousePos - ConvertVector(vec)).Magnitude
+								if d < bestDist then
+									bestPart, bestPos, bestDist = part, pos, d
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+		return bestPart, bestPos
+	end
+
+	-- Static (legacy LockPart behavior, read live so runtime config changes apply).
+	local part = FindFirstChild(Character, Settings.LockPart)
+	if part == nil then
+		return nil, nil
+	end
+	local okPos, pos = pcall(function() return __index(part, "Position") end)
+	if not okPos or pos == nil then
+		return nil, nil
+	end
+	return part, pos
+end)
+
+-- Cached visibility: short-lived, invalidated by TTL. One shared pipeline.
+CheckVisibilityCached = LPH_NO_VIRTUALIZE(function(PartPosition, Character)
+	local Settings = Environment.Settings
+	local ttl = Environment.Performance.VisibilityTTL or 0.15
+	local key = tostring(__index(Character, "Name") or Character) .. "@" .. tostring(mathfloor(PartPosition.X)) .. "," .. tostring(mathfloor(PartPosition.Y)) .. "," .. tostring(mathfloor(PartPosition.Z))
+	local now = tick()
+	local hit = VisibilityCache[key]
+	if hit ~= nil and (now - hit.Time) < ttl then
+		return hit.Visible
+	end
+
+	local BlacklistTable = {}
+	pcall(function()
+		local localChar = __index(LocalPlayer, "Character")
+		if localChar ~= nil then
+			for _, v in next, GetDescendants(localChar) do
+				BlacklistTable[#BlacklistTable + 1] = v
+			end
+		end
+	end)
+	for _, v in next, GetDescendants(Character) do
+		BlacklistTable[#BlacklistTable + 1] = v
+	end
+
+	local visible = true
+	local ok, parts = pcall(function()
+		return GetPartsObscuringTarget(Camera, { PartPosition }, BlacklistTable)
+	end)
+	if ok and parts ~= nil and #parts > 0 then
+		visible = false
+	end
+
+	VisibilityCache[key] = { Visible = visible, Time = now }
+	return visible
+end)
+
+local EffectiveFOVRadius = LPH_NO_VIRTUALIZE(function(WorldDistance)
+	local FOVSettings = Environment.FOVSettings
+	local radius = FOVSettings.Enabled and FOVSettings.Radius or 2000
+	if FOVSettings.DynamicFOV and WorldDistance ~= nil then
+		local scale = mathclamp(WorldDistance / 500, FOVSettings.DynamicMin or 0.7, FOVSettings.DynamicMax or 1.3)
+		radius = radius * scale
+	end
+	return radius
+end)
+
+-- Canonical validation pipeline (§35 order). No scoring here; cheap checks first.
+local IsValidTarget = LPH_NO_VIRTUALIZE(function(Player)
+	local Settings = Environment.Settings
+
+	if Player == nil then
+		return false
+	end
+	local okParent = pcall(function() return __index(Player, "Parent") end)
+	if not okParent or __index(Player, "Parent") == nil then
+		return false
+	end
+	if Player == LocalPlayer then
+		return false
+	end
+
+	local Character, Humanoid, RootPart = GetCharacterData(Player)
+	if Character == nil then
+		return false
+	end
+
+	if Settings.AliveCheck then
+		local okH, hp = pcall(function() return __index(Humanoid, "Health") end)
+		if not okH or hp <= 0 then
+			return false
+		end
+	end
+
+	-- 6. Team Check (before scoring; teammates never receive a score).
+	if IsTeammate(Player) then
+		return false
+	end
+
+	-- Neutral handling.
+	if IsNeutral(Player) and not Settings.IncludeNeutralPlayers then
+		return false
+	end
+
+	-- 7. Friend Check. 8. Blacklist (blacklist always wins; no score calculated).
+	if IsFriend(Player) then
+		return false
+	end
+	local playerName
+	pcall(function() playerName = __index(Player, "Name") end)
+	if playerName ~= nil and tablefind(Environment.Blacklisted, playerName) then
+		return false
+	end
+
+	-- 10/11. Distance + FOV + part existence (part check before visibility: no part = no aim).
+	local _, partPos = ResolveAimPart(Character)
+	if partPos == nil then
+		return false
+	end
+
+	local camPos = __index(Camera, "CFrame").Position
+	local worldDist = (camPos - partPos).Magnitude
+	if worldDist > (Settings.MaxDistance or 1000) then
+		return false
+	end
+
+	local okV, vec, onScreen = pcall(function() return WorldToViewportPoint(Camera, partPos) end)
+	if not okV or not onScreen then
+		return false
+	end
+	local screenDist = (GetMouseLocation(UserInputService) - ConvertVector(vec)).Magnitude
+	if screenDist > EffectiveFOVRadius(worldDist) then
+		return false
+	end
+
+	-- 12. Visibility.
+	if Settings.WallCheck then
+		local visible = CheckVisibilityCached(partPos, Character)
+		if not visible and Settings.StrictVisibility then
+			return false
+		end
+	end
+
+	return true
+end)
+
+-- Weighted scoring. All metrics normalized 0-1; higher = better.
+local ScoreTarget = LPH_NO_VIRTUALIZE(function(Player, ScreenDist, WorldDist, Visible, HealthFrac, IsCurrent)
+	local Settings = Environment.Settings
+	local W = Environment.Scoring
+	local radius = EffectiveFOVRadius(WorldDist)
+	if radius <= 0 then
+		radius = 1
+	end
+
+	local fovScore = 1 - mathclamp(ScreenDist / radius, 0, 1)
+	local distScore = 1 - mathclamp(WorldDist / (Settings.MaxDistance or 1000), 0, 1)
+	local visScore = 1
+	if Settings.WallCheck then
+		if Visible then
+			visScore = 1
+		elseif Settings.StrictVisibility then
+			visScore = 0
+		else
+			visScore = 0.35
+		end
+	end
+	local healthScore = 1 - mathclamp(HealthFrac or 0, 0, 1)
+
+	local priorityScore = 1
+	if #Environment.PriorityPlayers > 0 then
+		priorityScore = 0.2
+		local playerName
+		pcall(function() playerName = __index(Player, "Name") end)
+		if playerName ~= nil and tablefind(Environment.PriorityPlayers, playerName) then
+			priorityScore = 1
+		end
+	end
+
+	local totalW = (W.FOVWeight or 0) + (W.DistanceWeight or 0) + (W.VisibilityWeight or 0) + (W.HealthWeight or 0) + (W.PriorityWeight or 0) + (W.PersistenceWeight or 0)
+	if totalW <= 0 then
+		totalW = 1
+	end
+
+	local score = (fovScore * (W.FOVWeight or 0)
+		+ distScore * (W.DistanceWeight or 0)
+		+ visScore * (W.VisibilityWeight or 0)
+		+ healthScore * (W.HealthWeight or 0)
+		+ priorityScore * (W.PriorityWeight or 0)) / totalW
+
+	if IsCurrent then
+		score = score + (Settings.TargetStickiness or 0) * (W.PersistenceWeight or 0) / totalW
+	end
+
+	LastBreakdown.FOV = fovScore
+	LastBreakdown.Distance = distScore
+	LastBreakdown.Visibility = visScore
+	LastBreakdown.Health = healthScore
+	LastBreakdown.Priority = priorityScore
+
+	return score
+end)
+
+local ShouldSwitchTarget = LPH_NO_VIRTUALIZE(function(NewScore, CurrentScore)
+	return NewScore > CurrentScore + (Environment.Settings.SwitchThreshold or 0.12)
+end)
+
+-- Full candidate scan at scheduler rate. Single shared pipeline: IsValidTarget
+-- gates (populating the visibility cache), then scoring data is gathered with
+-- no duplicate raycasts. Returns best player + score per PriorityMode.
+local RefreshScan = LPH_NO_VIRTUALIZE(function()
+	local Settings = Environment.Settings
+	local mousePos = GetMouseLocation(UserInputService)
+	local camPos = __index(Camera, "CFrame").Position
+
+	local results = {}
+	local best, bestScore = nil, -1
+	local bestBreakdown = nil
+	local cursorBest, cursorDist = nil, mathhuge
+	local distBest, distDist = nil, mathhuge
+	local hpBest, hpFrac = nil, mathhuge
+
+	for _, Value in next, PlayerCache do
+		if Value ~= LocalPlayer and Value.Parent ~= nil and IsValidTarget(Value) then
+			local Character = __index(Value, "Character")
+			if Character ~= nil then
+				local _, partPos = ResolveAimPart(Character)
+				if partPos ~= nil then
+					local worldDist = (camPos - partPos).Magnitude
+					local okV, vec, onScreen = pcall(function() return WorldToViewportPoint(Camera, partPos) end)
+					if okV and onScreen then
+						local screenDist = (mousePos - ConvertVector(vec)).Magnitude
+						local visible = true
+						if Settings.WallCheck then
+							visible = CheckVisibilityCached(partPos, Character)
+						end
+						local Humanoid = FindFirstChildOfClass(Character, "Humanoid")
+						local healthFrac = 0
+						if Humanoid ~= nil then
+							local okH, hp, maxHp = pcall(function()
+								return __index(Humanoid, "Health"), __index(Humanoid, "MaxHealth")
+							end)
+							if okH and maxHp > 0 then
+								healthFrac = mathclamp(hp / maxHp, 0, 1)
+							end
+						end
+						local isCurrent = (Environment.Locked == Value)
+						local score = ScoreTarget(Value, screenDist, worldDist, visible, healthFrac, isCurrent)
+						results[#results + 1] = { Player = Value, Score = score, ScreenDist = screenDist, WorldDist = worldDist, Health = healthFrac }
+						if score > bestScore then
+							best, bestScore = Value, score
+							bestBreakdown = { FOV = LastBreakdown.FOV, Distance = LastBreakdown.Distance, Visibility = LastBreakdown.Visibility, Health = LastBreakdown.Health, Priority = LastBreakdown.Priority }
+						end
+						if screenDist < cursorDist then
+							cursorBest, cursorDist = Value, screenDist
+						end
+						if worldDist < distDist then
+							distBest, distDist = Value, worldDist
+						end
+						if healthFrac < hpFrac then
+							hpBest, hpFrac = Value, healthFrac
+						end
+					end
+				end
+			end
+		end
+	end
+
+	local mode = Settings.PriorityMode or "Score"
+	if mode == "ClosestToCursor" and cursorBest ~= nil then
+		best = cursorBest
+		for _, r in next, results do
+			if r.Player == best then
+				bestScore = r.Score
+				break
+			end
+		end
+	elseif mode == "ClosestDistance" and distBest ~= nil then
+		best = distBest
+		for _, r in next, results do
+			if r.Player == best then
+				bestScore = r.Score
+				break
+			end
+		end
+	elseif mode == "LowestHealth" and hpBest ~= nil then
+		best = hpBest
+		for _, r in next, results do
+			if r.Player == best then
+				bestScore = r.Score
+				break
+			end
+		end
+	elseif mode == "Priority" then
+		-- Best score among PriorityPlayers; falls back to score-best when none present.
+		local prioBest, prioScore = nil, -1
+		for _, r in next, results do
+			local okN, pname = pcall(function() return __index(r.Player, "Name") end)
+			if okN and pname ~= nil and tablefind(Environment.PriorityPlayers, pname) and r.Score > prioScore then
+				prioBest, prioScore = r.Player, r.Score
+			end
+		end
+		if prioBest ~= nil then
+			best, bestScore = prioBest, prioScore
+		end
+	end
+
+	if bestBreakdown ~= nil then
+		LastBreakdown.FOV = bestBreakdown.FOV
+		LastBreakdown.Distance = bestBreakdown.Distance
+		LastBreakdown.Visibility = bestBreakdown.Visibility
+		LastBreakdown.Health = bestBreakdown.Health
+		LastBreakdown.Priority = bestBreakdown.Priority
+	end
+
+	ScanState.Best = best
+	ScanState.BestScore = bestScore
+	ScanState.Results = results
+	ScanState.Time = tick()
+	return best, bestScore
+end)
+
+local ResetTargetState = LPH_NO_VIRTUALIZE(function()
+	VelocityState.Samples = {}
+	VelocityState.AvgVelocity = Vector3zero
+	VelocityState.SmoothVel = nil
+	VelocityState.Acceleration = Vector3zero
+	VelocityState.Confidence = 0
+	VelocityState.LastPos = nil
+	VelocityState.LastTime = 0
+	VelocityState.Stable = true
+	-- Target-specific prediction state goes; connection-level ping stats stay.
+	PingState.ErrBuf = {}
+	PingState.LastPred = nil
+end)
+
+-- Forward declaration: HookTargetDied is assigned after CancelLock/DebugLockRelease
+-- (its body calls both, so it must be defined textually after them).
+local HookTargetDied
+
+local AcquireLock = LPH_NO_VIRTUALIZE(function(Player, Score)
+	if Environment.Locked ~= Player then
+		ResetTargetState()
+		LockMeta.Previous = Environment.Locked
+		LockMeta.PrevPos = nil
+		LockMeta.PrevTime = 0
+		HookTargetDied(Player)
+		local name = "?"
+		pcall(function() name = __index(Player, "Name") end)
+		if (tick() - (LockMeta.LastAcqPrint or 0)) > 1 then
+			LockMeta.LastAcqPrint = tick()
+			dprint("lock acquired:", name, "score:", string.format("%.2f", Score or -1))
+		end
+	end
+	Environment.Locked = Player
+	LockMeta.Since = tick()
+	LockMeta.LastSeen = tick()
+	LockMeta.LastScore = Score or 0
+end)
+
+local CancelLock = LPH_NO_VIRTUALIZE(function()
+	if ServiceConnections.TargetDied ~= nil then
+		pcall(Disconnect, ServiceConnections.TargetDied)
+		ServiceConnections.TargetDied = nil
+	end
+	if ServiceConnections.TargetCharAdded ~= nil then
+		pcall(Disconnect, ServiceConnections.TargetCharAdded)
+		ServiceConnections.TargetCharAdded = nil
+	end
+	if ServiceConnections.TargetCharRemoving ~= nil then
+		pcall(Disconnect, ServiceConnections.TargetCharRemoving)
+		ServiceConnections.TargetCharRemoving = nil
+	end
+	Environment.Locked = nil
+	LockMeta.LastScore = -1
+	LockMeta.Since = 0
+	LockMeta.LastSeen = 0
+	LockMeta.PrevPos = nil
+	LockMeta.PrevTime = 0
+	LockMeta.RetainRadius = nil
+
+	setrenderproperty(Environment.FOVCircle, "Color", Environment.FOVSettings.Color)
+	__newindex(UserInputService, "MouseDeltaSensitivity", OriginalSensitivity)
+
+	if Animation then
+		Animation:Cancel()
+	end
+
+	ResetTargetState()
+	setrenderproperty(Environment.Tracer, "Visible", Environment.ClosestPlayerTracer.Enabled)
+end)
+
+-- Locked-target fast path: cheap checks every frame (no raycast; cache only).
+local ValidateLocked = LPH_NO_VIRTUALIZE(function()
+	local locked = Environment.Locked
+	if locked == nil then
+		return false
+	end
+	if locked.Parent == nil then
+		return false
+	end
+	if IsTeammate(locked) then
+		return false
+	end
+	local Character, Humanoid, _ = GetCharacterData(locked)
+	if Character == nil then
+		return false
+	end
+	if Environment.Settings.AliveCheck then
+		local okH, hp = pcall(function() return __index(Humanoid, "Health") end)
+		if not okH or hp <= 0 then
+			return false
+		end
+	end
+	local _, partPos = ResolveAimPart(Character)
+	if partPos == nil then
+		return false
+	end
+	-- Still inside effective FOV? (Uses last scan radius semantics: reject only when
+	-- clearly outside, so the lock survives small cursor movement = stickiness.)
+	local camPos = __index(Camera, "CFrame").Position
+	local worldDist = (camPos - partPos).Magnitude
+	local okV, vec, onScreen = pcall(function() return WorldToViewportPoint(Camera, partPos) end)
+	if not okV or not onScreen then
+		return false
+	end
+	local screenDist = (GetMouseLocation(UserInputService) - ConvertVector(vec)).Magnitude
+	-- Lock retention: acquisition-anchored SMALL radius (LockMeta.RetainRadius),
+	-- never the broad acquisition FOV. A target leaving the active aim region is
+	-- released immediately even if still inside the FOV and otherwise valid.
+	-- Stickiness/hysteresis only choose BETWEEN valid targets; they never retain this one.
+	local retainR = LockMeta.RetainRadius or Environment.Settings.LockRetentionRadius or 30
+	if screenDist > retainR then
+		return false
+	end
+	LockMeta.LastSeen = tick()
+	return true
+end)
+
+-- Hard-invalid detection for the CURRENT lock. Death / destruction / departure /
+-- team change must cancel the lock IMMEDIATELY (no grace period) so a corpse's
+-- falling velocity can never reach prediction. Returns a reason string, or nil
+-- when the lock is alive and usable. Cheap: property reads only, no raycasts.
+local LockDeathReason = LPH_NO_VIRTUALIZE(function()
+	local locked = Environment.Locked
+	if locked == nil then
+		return "No lock"
+	end
+	local okParent, parent = pcall(function() return __index(locked, "Parent") end)
+	if not okParent or parent == nil then
+		return "TARGET_LEFT_GAME"
+	end
+	local okChar, Character = pcall(function() return __index(locked, "Character") end)
+	if not okChar or Character == nil then
+		return "TARGET_REPLACED"
+	end
+	-- A dead character may linger briefly: it must still live in the world.
+	local okWorld, inWorld = pcall(function()
+		return __index(Character, "IsDescendantOf")(Character, workspace)
+	end)
+	if not okWorld or not inWorld then
+		return "TARGET_LEFT_WORKSPACE"
+	end
+	local Humanoid = FindFirstChildOfClass(Character, "Humanoid")
+	if Humanoid == nil then
+		return "TARGET_MISSING_HUMANOID"
+	end
+	if Environment.Settings.AliveCheck then
+		local okH, hp = pcall(function() return __index(Humanoid, "Health") end)
+		if not okH then
+			return "TARGET_HEALTH_ZERO"
+		end
+		if hp <= 0 then
+			return "TARGET_DIED"
+		end
+		-- Health can lag replication on kill: the Dead state is authoritative.
+		local okS, state = pcall(function()
+			return __index(Humanoid, "GetState")(Humanoid)
+		end)
+		if okS and state == Enum.HumanoidStateType.Dead then
+			return "TARGET_STATE_DEAD"
+		end
+	end
+	local part, _ = ResolveAimPart(Character)
+	if part == nil then
+		return "TARGET_PART_MISSING"
+	end
+	local okA, inChar = pcall(function()
+		return __index(part, "IsDescendantOf")(part, Character)
+	end)
+	if not okA or not inChar then
+		return "TARGET_PART_MISSING"
+	end
+	if IsTeammate(locked) then
+		return "TARGET_TEAM_CHANGED"
+	end
+	return nil
+end)
+
+local LockReleaseLastLog = 0
+
+-- Throttled lock-release snapshot: reason + the exact values that were alive
+-- at release time (proves no corpse velocity leaks into the next frames).
+local DebugLockRelease = LPH_NO_VIRTUALIZE(function(Reason, Detail)
+	if not Environment.Debugger.Enabled then
+		return
+	end
+	local now = tick()
+	if (now - LockReleaseLastLog) < (Environment.Debugger.Rate or 0.5) then
+		return
+	end
+	LockReleaseLastLog = now
+	local locked = Environment.Locked
+	local hp, hState, cParent, sdTxt = -1, "?", "?", "?"
+	local rawVel, smoothVel, accel = Vector3zero, Vector3zero, Vector3zero
+	local partPosTxt, prevTxt = "?", "none"
+	if locked ~= nil then
+		pcall(function()
+			local Character = __index(locked, "Character")
+			if Character ~= nil then
+				cParent = tostring(__index(Character, "Parent"))
+				local Humanoid = FindFirstChildOfClass(Character, "Humanoid")
+				if Humanoid ~= nil then
+					hp = __index(Humanoid, "Health")
+					hState = tostring(__index(Humanoid, "GetState")(Humanoid))
+				end
+				local _, pp = ResolveAimPart(Character)
+				if pp ~= nil then
+					partPosTxt = string.format("(%.1f, %.1f, %.1f)", pp.X, pp.Y, pp.Z)
+					local okV, vec, onS = pcall(function() return WorldToViewportPoint(Camera, pp) end)
+					if okV and onS then
+						sdTxt = string.format("%.0f", (GetMouseLocation(UserInputService) - ConvertVector(vec)).Magnitude)
+					end
+				end
+			end
+		end)
+	end
+	local samples = VelocityState.Samples
+	if #samples > 0 then
+		rawVel = samples[#samples]
+	end
+	if VelocityState.SmoothVel ~= nil then
+		smoothVel = VelocityState.SmoothVel
+	end
+	accel = VelocityState.Acceleration
+	if LockMeta.PrevPos ~= nil then
+		prevTxt = string.format("(%.1f, %.1f, %.1f)", LockMeta.PrevPos.X, LockMeta.PrevPos.Y, LockMeta.PrevPos.Z)
+	end
+	_warn(string.format(
+		"[Aimbot] LOCK RELEASED: %s | HP %.0f STATE %s CHARPARENT %s | POS %s PREV %s | ACQ %d RET %.0f SD %s | RAWVEL (%.1f, %.1f, %.1f) | SMOOTHVEL (%.1f, %.1f, %.1f) | ACCEL %.1f | EFFTIME %.3fs | CONF %.2f | ACTION: RELEASE LOCK | %s",
+		tostring(Reason), hp, tostring(hState), tostring(cParent),
+		partPosTxt, prevTxt,
+		(Environment.FOVSettings.Radius or 180),
+		(LockMeta.RetainRadius or (Environment.Settings.LockRetentionRadius or 30)),
+		sdTxt,
+		rawVel.X, rawVel.Y, rawVel.Z,
+		smoothVel.X, smoothVel.Y, smoothVel.Z,
+		accel.Magnitude, PingState.Effective or 0, VelocityState.Confidence,
+		tostring(Detail or "")
+	))
+end)
+
+-- Humanoid.Died hookup for the CURRENT lock: death invalidates immediately,
+-- without waiting for the next scan cycle. Exactly one connection exists at a
+-- time; it is replaced on target change and removed on cancel / leave / unload
+-- (via ServiceConnections). Re-hooking the same humanoid never duplicates.
+HookTargetDied = LPH_NO_VIRTUALIZE(function(Player)
+	if ServiceConnections.TargetDied ~= nil then
+		pcall(Disconnect, ServiceConnections.TargetDied)
+		ServiceConnections.TargetDied = nil
+	end
+	if ServiceConnections.TargetCharAdded ~= nil then
+		pcall(Disconnect, ServiceConnections.TargetCharAdded)
+		ServiceConnections.TargetCharAdded = nil
+	end
+	if ServiceConnections.TargetCharRemoving ~= nil then
+		pcall(Disconnect, ServiceConnections.TargetCharRemoving)
+		ServiceConnections.TargetCharRemoving = nil
+	end
+	if Player == nil then
+		return
+	end
+	-- Player-level hooks survive respawns (the Player object is stable, the
+	-- Humanoid is not): any character swap cancels the lock so stale velocity
+	-- history can never transfer to the new character.
+	local okA, connA = pcall(function()
+		return Connect(__index(Player, "CharacterAdded"), LPH_NO_VIRTUALIZE(function()
+			ClearTeamCache(Player)
+			if Environment.Locked == Player then
+				DebugLockRelease("TARGET_REPLACED (respawn)")
+				CancelLock()
+			end
+		end))
+	end)
+	if okA and connA ~= nil then
+		ServiceConnections.TargetCharAdded = connA
+	end
+	local okR, connR = pcall(function()
+		return Connect(__index(Player, "CharacterRemoving"), LPH_NO_VIRTUALIZE(function()
+			if Environment.Locked == Player then
+				DebugLockRelease("CHARACTER_REMOVED")
+				CancelLock()
+			end
+		end))
+	end)
+	if okR and connR ~= nil then
+		ServiceConnections.TargetCharRemoving = connR
+	end
+	local okC, Character = pcall(function() return __index(Player, "Character") end)
+	if not okC or Character == nil then
+		return
+	end
+	local Humanoid = FindFirstChildOfClass(Character, "Humanoid")
+	if Humanoid == nil then
+		return
+	end
+	local okD, conn = pcall(function()
+		return Connect(__index(Humanoid, "Died"), LPH_NO_VIRTUALIZE(function()
+			if Environment.Locked == Player then
+				DebugLockRelease("TARGET_DIED (event)")
+				CancelLock()
+			end
+		end))
+	end)
+	if okD and conn ~= nil then
+		ServiceConnections.TargetDied = conn
+	end
+end)
+
+-- Position sanity (secondary net): finite check + impossible single-frame
+-- displacement. Generous by design: legit fast movement (vehicles, falling,
+-- flings within reason) passes; map-fall-through / teleport-scale jumps fail.
+-- Purely relative to the previous valid position: no world-Y hardcoding, so
+-- maps with legitimate negative coordinates are unaffected.
+local CheckPositionSanity = LPH_NO_VIRTUALIZE(function(Pos, DeltaTime)
+	if Pos.X ~= Pos.X or Pos.Y ~= Pos.Y or Pos.Z ~= Pos.Z then
+		return false, "TARGET_POSITION_INVALID"
+	end
+	if mathabs(Pos.X) > 100000 or mathabs(Pos.Y) > 100000 or mathabs(Pos.Z) > 100000 then
+		return false, "TARGET_POSITION_INVALID"
+	end
+	local S = Environment.Settings
+	if not S.PositionSanityCheck then
+		return true
+	end
+	local prev = LockMeta.PrevPos
+	if prev == nil then
+		return true -- baseline frame; nothing to compare against yet
+	end
+	local dt = tick() - (LockMeta.PrevTime or tick())
+	if dt <= 0 then
+		dt = DeltaTime or 0.016
+	end
+	local allow = (S.MaxTargetDisplacement or 400) * dt + 5
+	if (Pos - prev).Magnitude > allow then
+		return false, "TARGET_MOVED_TOO_FAR"
+	end
+	local vAllow = (S.MaxVerticalDisplacement or 300) * dt + 5
+	if mathabs(Pos.Y - prev.Y) > vAllow then
+		return false, "TARGET_MOVED_TOO_FAR"
+	end
+	return true
+end)
+
+-- GetClosestPlayer: preserved public behavior, now backed by the shared pipeline.
+-- Aux=true  -> returns best candidate WITHOUT locking (tracer / queries).
+-- Aux=nil   -> maintains Environment.Locked with hysteresis.
+local GetClosestPlayer = LPH_NO_VIRTUALIZE(function(Aux)
+	local Settings = Environment.Settings
+
+	if not Environment.Locked or Aux then
+		local now = tick()
+		if (now - ScanState.Time) >= (Environment.Performance.TargetScanRate or 0.12) or ScanState.Best == nil then
+			RefreshScan()
+		end
+
+		local best, bestScore = ScanState.Best, ScanState.BestScore
+		if best == nil then
+			-- Fallback: legacy ClosestDistance within scan results for ClosestDistance mode.
+			return nil
+		end
+
+		if not Aux then
+			RequiredDistance = Environment.FOVSettings.Enabled and Environment.FOVSettings.Radius or 2000
+			local acqDist = Settings.LockRetentionRadius or 30
+			local _, partPos = ResolveAimPart(__index(best, "Character"))
+			if partPos ~= nil then
+				Required3DDistance = (__index(Camera, "CFrame").Position - partPos).Magnitude
+				local okV, vec, _ = pcall(function() return WorldToViewportPoint(Camera, partPos) end)
+				if okV then
+					RequiredDistance = (GetMouseLocation(UserInputService) - ConvertVector(vec)).Magnitude
+					acqDist = RequiredDistance
+				end
+			end
+			-- Retention anchor: acquisition-anchored (original Exunys semantics) with
+			-- the small configured floor. A kill-time lock is therefore tight: the
+			-- falling body exits it within a few frames.
+			LockMeta.RetainRadius = math.max(Settings.LockRetentionRadius or 30, acqDist)
+			AcquireLock(best, bestScore)
+		elseif not Running and not Environment.Locked then
+			return best
+		end
+		return best
+	else
+		-- Hard-invalid (dead / destroyed / left / teammate): cancel IMMEDIATELY.
+		-- No grace period here: grace exists for briefly-occluded LIVE targets,
+		-- and a corpse's falling velocity must never reach prediction.
+		local deathReason = LockDeathReason()
+		if deathReason ~= nil then
+			DebugLockRelease(deathReason)
+			CancelLock()
+			return nil
+		end
+		-- Hysteresis: keep the lock unless clearly invalid; switch only when a
+		-- challenger is meaningfully better.
+		if ValidateLocked() then
+			local now = tick()
+			if (now - ScanState.Time) >= (Environment.Performance.TargetScanRate or 0.12) then
+				RefreshScan()
+				local best, bestScore = ScanState.Best, ScanState.BestScore
+				if best ~= nil and best ~= Environment.Locked and ShouldSwitchTarget(bestScore, LockMeta.LastScore) then
+					AcquireLock(best, bestScore)
+				elseif best ~= nil and best == Environment.Locked then
+					LockMeta.LastScore = bestScore
+				end
+			end
+			return Environment.Locked
+		end
+
+		-- Grace period (LIVE targets only: briefly out-of-FOV / occluded).
+		-- Dead, destroyed, left or teammate targets never reach here:
+		-- they are cancelled above with no grace and fully cleared state.
+		if (tick() - LockMeta.LastSeen) < (Settings.TargetGracePeriod or 0.1) then
+			return Environment.Locked
+		end
+		CancelLock()
+		return nil
+	end
+end)
+
+-- Velocity sampling (locked target only, every frame): short rolling history,
+-- average velocity, acceleration estimate, direction-change aware confidence.
+local SampleVelocity = LPH_NO_VIRTUALIZE(function(Part, DeltaTime)
+	local now = tick()
+	local pos
+	local okP, p = pcall(function() return __index(Part, "Position") end)
+	if not okP or p == nil then
+		return
+	end
+	pos = p
+
+	local vel = nil
+	local root = FindFirstChild(__index(Part, "Parent"), "HumanoidRootPart")
+	if root ~= nil then
+		local okV, v = pcall(function() return __index(root, "AssemblyLinearVelocity") end)
+		if okV and v ~= nil and v.Magnitude < 10000 then
+			vel = v
+		else
+			local okV2, v2 = pcall(function() return __index(root, "Velocity") end)
+			if okV2 and v2 ~= nil and v2.Magnitude < 10000 then
+				vel = v2
+			end
+		end
+	end
+	if vel == nil and VelocityState.LastPos ~= nil and DeltaTime > 0 then
+		vel = (pos - VelocityState.LastPos) / DeltaTime
+	end
+	if vel == nil then
+		return
+	end
+
+	local samples = VelocityState.Samples
+	samples[#samples + 1] = vel
+	local maxSamples = Environment.Performance.VelocitySamples or 5
+	while #samples > maxSamples do
+		tableremove(samples, 1)
+	end
+
+	local sum = Vector3zero
+	for _, v in next, samples do
+		sum = sum + v
+	end
+	local avg = sum / #samples
+	local prevAvg = VelocityState.AvgVelocity
+	VelocityState.AvgVelocity = avg
+	-- Smoothed velocity (EMA): the value prediction actually uses. Quieter than
+	-- the rolling average when samples are noisy.
+	local Nw = Environment.Network
+	if Nw ~= nil and Nw.VelocitySmoothing == false then
+		VelocityState.SmoothVel = vel
+	else
+		local va = (Nw ~= nil and Nw.VelocityAlpha) or 0.35
+		local sv = VelocityState.SmoothVel
+		if sv == nil then
+			VelocityState.SmoothVel = vel
+		else
+			VelocityState.SmoothVel = sv + (vel - sv) * mathclamp(va, 0.01, 1)
+		end
+	end
+	if DeltaTime > 0 then
+		VelocityState.Acceleration = (avg - prevAvg) / DeltaTime
+	end
+
+	-- Direction change: latest sample vs average.
+	local dirStable = true
+	if avg.Magnitude > 1 and vel.Magnitude > 1 then
+		local dot = (avg.Unit.X * vel.Unit.X) + (avg.Unit.Y * vel.Unit.Y) + (avg.Unit.Z * vel.Unit.Z)
+		if dot < 0.5 then
+			dirStable = false
+		end
+	end
+
+	-- Stability: low variance across samples = stable.
+	local variance = 0
+	for _, v in next, samples do
+		variance = variance + (v - avg).Magnitude
+	end
+	variance = variance / #samples
+	local stable = dirStable and variance < 12
+
+	if stable then
+		VelocityState.Confidence = mathclamp(VelocityState.Confidence + DeltaTime * 2, 0, 1)
+	else
+		VelocityState.Confidence = mathclamp(VelocityState.Confidence - DeltaTime * 4, 0, 1)
+	end
+	VelocityState.Stable = stable
+	VelocityState.LastPos = pos
+	VelocityState.LastTime = now
+end)
+
+-- Latency-driven prediction.
+--   Ping    -> HOW FAR into the future to predict (time).
+--   Velocity-> WHICH DIRECTION / how far in space (direction).
+--   Jitter  -> confidence adjustment (never a direct prediction value).
+-- Falls back to the legacy paths when ping is unavailable or PingPrediction is OFF.
+local ComputePrediction = LPH_NO_VIRTUALIZE(function(PartPos, WorldDistance)
+	local P = Environment.Prediction
+	local N = Environment.Network
+	local vel = VelocityState.SmoothVel or VelocityState.AvgVelocity or Vector3zero
+
+	if N == nil or not N.PingPrediction or not PingState.Available then
+		if not P.Adaptive then
+			return PartPos + vel * mathclamp(P.Base or 0.12, P.Min or 0, P.Max or 0.3), 1
+		end
+
+		local speed = vel.Magnitude
+		local accel = VelocityState.Acceleration.Magnitude
+		local time = (P.Base or 0.12)
+			+ mathclamp(speed * (P.VelocityInfluence or 0.35) * 0.01, 0, 0.15)
+			+ mathclamp((WorldDistance or 0) * (P.DistanceInfluence or 0.25) * 0.0002, 0, 0.1)
+			+ mathclamp(accel * (P.AccelerationInfluence or 0.15) * 0.001, 0, 0.08)
+		time = mathclamp(time, P.Min or 0, P.Max or 0.3)
+
+		local conf = VelocityState.Confidence
+		if #VelocityState.Samples == 0 then
+			conf = 0.5
+		end
+		local predicted = PartPos + vel * time * (0.4 + 0.6 * conf)
+		return predicted, conf
+	end
+
+	-- One-way latency estimate: Roblox ping is round-trip, so halve the smoothed value.
+	local oneWay = (PingState.Smoothed / 1000) / 2
+	local time = oneWay * (N.PingMultiplier or 1)
+	time = time * PingState.Correction -- slow auto-calibration (overshoot/undershoot bias)
+	if N.DistanceCompensation ~= false then
+		time = time + mathclamp((WorldDistance or 0) / 1000 * 0.05 * (N.DistanceStrength or 1), 0, 0.06)
+	end
+
+	local conf = VelocityState.Confidence
+	if #VelocityState.Samples == 0 then
+		conf = 0.5
+	end
+	if N.JitterCompensation ~= false then
+		conf = conf * (1 - mathclamp(PingState.Jitter / 80, 0, 0.6) * (N.JitterStrength or 0.5))
+	end
+	conf = mathclamp(conf, 0, 1)
+
+	local strength = P.ConfidenceStrength or 0.6
+	time = time * ((1 - strength) + strength * conf)
+	time = mathclamp(time, N.MinLatency or 0.02, N.MaxLatency or 0.3)
+	PingState.Effective = time
+
+	local predicted = PartPos
+	if vel.Magnitude > 0.01 then
+		predicted = PartPos + vel * time
+	end
+	return predicted, conf
+end)
+
+-- Ping sampling (low frequency). Reads the real Stats ping, smooths with EMA +
+-- spike rejection, keeps a bounded history, derives jitter + connection quality.
+-- Never errors: on failure PingState.Available stays false and legacy paths run.
+local SamplePing = LPH_NO_VIRTUALIZE(function()
+	local N = Environment.Network
+	local raw = nil
+	local okS, stats = pcall(function() return GetService("Stats") end)
+	if okS and stats ~= nil then
+		local okI, item = pcall(function()
+			return __index(__index(__index(stats, "Network"), "ServerStatsItem"), "Data Ping")
+		end)
+		if okI and item ~= nil then
+			local okV, v = pcall(function() return item:GetValue() end)
+			if okV and type(v) == "number" and v > 0 and v < 10000 then
+				raw = v
+			else
+				local okS2, s = pcall(function() return item:GetValueString() end)
+				if okS2 and type(s) == "string" then
+					local num = string.match(s, "%d+")
+					if num ~= nil then
+						raw = tonumber(num)
+					end
+				end
+			end
+		end
+	end
+	if raw == nil then
+		PingState.Available = false
+		return
+	end
+
+	PingState.Available = true
+	PingState.Raw = raw
+	if PingState.Smoothed <= 0 then
+		PingState.Smoothed = raw
+	else
+		local alpha = (N ~= nil and N.PingAlpha) or 0.1
+		if N ~= nil and N.PingSmoothing == false then
+			alpha = 1
+		end
+		if mathabs(raw - PingState.Smoothed) > 120 then
+			alpha = alpha * 0.2 -- spike rejection: don't chase single bad samples
+		end
+		PingState.Smoothed = PingState.Smoothed + (raw - PingState.Smoothed) * mathclamp(alpha, 0.01, 1)
+	end
+
+	local hist = PingState.Samples
+	hist[#hist + 1] = raw
+	local maxH = (N ~= nil and N.PingHistory) or 20
+	while #hist > maxH do
+		tableremove(hist, 1)
+	end
+	local mn, mx, sum = mathhuge, 0, 0
+	for _, v in next, hist do
+		if v < mn then mn = v end
+		if v > mx then mx = v end
+		sum = sum + v
+	end
+	PingState.Min = mn
+	PingState.Max = mx
+
+	local inst = mathabs(raw - PingState.Smoothed)
+	PingState.Jitter = PingState.Jitter + (inst - PingState.Jitter) * (((N ~= nil and N.PingAlpha) or 0.1))
+
+	local s, j = PingState.Smoothed, PingState.Jitter
+	if s < 120 and j < 20 then
+		PingState.Quality = "Stable"
+	elseif s < 250 and j < 50 then
+		PingState.Quality = "Moderate"
+	else
+		PingState.Quality = "Unstable"
+	end
+	PingState.LastUpdate = tick()
+end)
+
+-- Slow self-calibration: compares actual positions against earlier predictions
+-- (directional bias only) and nudges the correction multiplier. Heavily clamped
+-- so one bad frame can never rewrite prediction.
+local UpdateCalibration = LPH_NO_VIRTUALIZE(function()
+	local N = Environment.Network
+	if N == nil or not N.AutoCalibration then
+		return
+	end
+	local buf = PingState.ErrBuf
+	if #buf < 4 then
+		return
+	end
+	local sum = 0
+	for _, v in next, buf do
+		sum = sum + v
+	end
+	local mean = sum / #buf
+	local step = mathclamp(mean, -1, 1) * (N.CalibrationRate or 0.05) * (N.CalibrationStrength or 1)
+	step = mathclamp(step, -0.01, 0.01)
+	PingState.Correction = mathclamp(PingState.Correction + step, N.CalibrationMin or 0.5, N.CalibrationMax or 1.5)
+	PingState.ErrBuf = {}
+end)
+
+-- Adaptive smoothing: small error = subtle correction, large error = stronger;
+-- unstable targets get more smoothing. Output is a clamped per-frame lerp factor.
+local ComputeSmoothing = LPH_NO_VIRTUALIZE(function(DeltaTime, ErrorPx, WorldDistance)
+	local S = Environment.Smoothing
+	local Settings = Environment.Settings
+
+	local base
+	if Settings.Sensitivity and Settings.Sensitivity > 0 then
+		base = mathclamp(DeltaTime / Settings.Sensitivity * 4, 0.02, 1)
+	else
+		base = 1
+	end
+
+	if not S.Adaptive then
+		return base
+	end
+
+	local errF = mathclamp(ErrorPx / 200, 0, 1)
+	local distF = mathclamp((WorldDistance or 0) / 1000, 0, 1)
+	local speedF = mathclamp(VelocityState.AvgVelocity.Magnitude / 50, 0, 1)
+
+	local factor = base
+		* (1 + errF * (S.ErrorInfluence or 0.6))
+		* (1 + distF * (S.DistanceInfluence or 0.2))
+		* (1 + speedF * (S.VelocityInfluence or 0.3))
+	if not VelocityState.Stable then
+		factor = factor * (1 - (S.StabilityInfluence or 0.4))
+	end
+	-- Unstable connection -> calmer aim output (jitter must not drive the crosshair).
+	if PingState.Quality == "Unstable" then
+		factor = factor * 0.7
+	elseif PingState.Quality == "Moderate" then
+		factor = factor * 0.85
+	end
+
+	return mathclamp(factor, S.Min or 0.08, S.Max or 0.9)
+end)
+
+-- Aim output abstraction (FINAL stage only). The shared pipeline (resolver,
+-- validation, prediction, smoothing factor) feeds ONE controller per frame.
+-- Switching methods is stateless: target, velocity and prediction state are
+-- untouched, so there is no snap and no reset. Resolver / prediction /
+-- smoothing never know which controller is active.
+local InputController = {}
+InputController.Available = type(mousemoverel) == "function"
+InputController.WarnOnce = false
+InputController.MoveRelative = LPH_NO_VIRTUALIZE(function(self, dx, dy)
+	if not InputController.Available then
+		if not InputController.WarnOnce then
+			InputController.WarnOnce = true
+			warn("[Aimbot] mousemoverel unavailable - Mouse method cannot move the cursor.")
+		end
+		return false
+	end
+	local ok, err = pcall(mousemoverel, dx, dy)
+	if not ok and not InputController.WarnOnce then
+		InputController.WarnOnce = true
+		warn("[Aimbot] mousemoverel failed: " .. tostring(err))
+	end
+	return ok
+end)
+
+local CameraAimController = {}
+CameraAimController.Aim = LPH_NO_VIRTUALIZE(function(self, data)
+	local goal = CFramenew(data.CamPos, data.PredictedPos)
+	__newindex(Camera, "CFrame", __index(Camera, "CFrame"):Lerp(goal, data.Alpha))
+	__newindex(UserInputService, "MouseDeltaSensitivity", 0)
+	return true
+end)
+
+local MouseAimController = {}
+MouseAimController.Aim = LPH_NO_VIRTUALIZE(function(self, data)
+	-- Cursor-relative aim. Camera CFrame is NEVER touched here.
+	local sens = Environment.Settings.Sensitivity2 or 1
+	if sens == 0 then
+		sens = 1
+	end
+	local dx = (data.ScreenPos.X - data.MousePos.X) * data.Alpha / sens
+	local dy = (data.ScreenPos.Y - data.MousePos.Y) * data.Alpha / sens
+	return InputController:MoveRelative(dx, dy)
+end)
+
+local AimController = {}
+AimController.SetMethod = LPH_NO_VIRTUALIZE(function(self, method)
+	if method == "Camera" or method == "Mouse" then
+		Environment.Settings.AimbotMethod = method
+		return true
+	end
+	return false
+end)
+AimController.Aim = LPH_NO_VIRTUALIZE(function(self, data)
+	if (Environment.Settings.AimbotMethod or "Camera") == "Mouse" then
+		return MouseAimController:Aim(data)
+	end
+	return CameraAimController:Aim(data)
+end)
+
+local PurgePlayer = LPH_NO_VIRTUALIZE(function(UserId)
+	VisibilityCache = {}
+	FriendSet[UserId] = nil
+	TeamCache[UserId] = nil
+	if Environment.Locked ~= nil then
+		local lockedId
+		pcall(function() lockedId = __index(Environment.Locked, "UserId") end)
+		if lockedId == UserId then
+			CancelLock()
+		end
+	end
+end)
+
+local DebugPrint = LPH_NO_VIRTUALIZE(function(Extra)
+	if not Environment.Debugger.Enabled then
+		return
+	end
+	local now = tick()
+	if (now - DebugLastPrint) < (Environment.Debugger.Rate or 0.5) then
+		return
+	end
+	DebugLastPrint = now
+
+	local locked = Environment.Locked
+	local targetName, targetTeam, teamCheck = "none", "-", "N/A"
+	local localTeam = "-"
+	pcall(function()
+		local t = __index(LocalPlayer, "Team")
+		localTeam = t ~= nil and __index(t, "Name") or "-"
+	end)
+	if locked ~= nil then
+		pcall(function() targetName = __index(locked, "Name") end)
+		pcall(function()
+			local t = __index(locked, "Team")
+			targetTeam = t ~= nil and __index(t, "Name") or "-"
+		end)
+		teamCheck = IsTeammate(locked) and "REJECT" or "PASS"
+	end
+
+	local acqR = Environment.FOVSettings.Radius or 180
+	local retR = LockMeta.RetainRadius or (Environment.Settings.LockRetentionRadius or 30)
+	local sdNow, graceLeft = -1, 0
+	if locked ~= nil then
+		pcall(function()
+			local Character = __index(locked, "Character")
+			if Character ~= nil then
+				local _, pp = ResolveAimPart(Character)
+				if pp ~= nil then
+					local okV, vec, onS = pcall(function() return WorldToViewportPoint(Camera, pp) end)
+					if okV and onS then
+						sdNow = (GetMouseLocation(UserInputService) - ConvertVector(vec)).Magnitude
+					end
+				end
+			end
+		end)
+		graceLeft = math.max(0, (Environment.Settings.TargetGracePeriod or 0.1) - (tick() - LockMeta.LastSeen))
+	end
+
+	local tsrc, tconf = "?", 0
+	if locked ~= nil then
+		pcall(function()
+			local ti = ResolveTeamInfo(locked)
+			if ti ~= nil then
+				tsrc = tostring(ti.Source or "?")
+				tconf = ti.Confidence or 0
+			end
+		end)
+	end
+
+	_warn(string.format(
+		"[Aimbot] TARGET: %s | TEAM: %s | LOCAL TEAM: %s | TEAM CHECK: %s | SCORE: %.2f (FOV %.2f DIST %.2f VIS %.2f HP %.2f PRIO %.2f) | CONF: %.2f | VEL: %.1f | PING %d/%dms JIT %dms NET %s | EFF %.3fs CORR %.2f | ACQ %d RET %.0f SD %.0f GRACE %.2f STICK %.2f | TSRC %s %.2f %s",
+		tostring(targetName), tostring(targetTeam), tostring(localTeam), tostring(teamCheck),
+		LockMeta.LastScore or -1, LastBreakdown.FOV, LastBreakdown.Distance,
+		LastBreakdown.Visibility, LastBreakdown.Health, LastBreakdown.Priority,
+		VelocityState.Confidence, VelocityState.AvgVelocity.Magnitude,
+		mathfloor(PingState.Raw or 0), mathfloor(PingState.Smoothed or 0), mathfloor(PingState.Jitter or 0),
+		tostring(PingState.Quality), PingState.Effective or 0, PingState.Correction or 1,
+		acqR, retR, sdNow, graceLeft, Environment.Settings.TargetStickiness or 0,
+		tsrc, tconf,
+		tostring(Extra or "")
+	))
+end)
+
+local Load = function()
+	OriginalSensitivity = __index(UserInputService, "MouseDeltaSensitivity")
+	dprint("Load: wiring connections (mode:", tostring(Environment.DeveloperSettings.UpdateMode) .. ")")
+
+	local Settings, Triggerbot, Tracer, FOVCircle, FOVCircleOutline, TracerSettings, FOVSettings, Offset = Environment.Settings, Environment.Triggerbot, Environment.Tracer, Environment.FOVCircle, Environment.FOVCircleOutline, Environment.ClosestPlayerTracer, Environment.FOVSettings
+
+	local DeveloperSettings = Environment.DeveloperSettings
+	local UpdateMode = DeveloperSettings.UpdateMode
+	local TeamCheckOption = DeveloperSettings.TeamCheckOption
+
+	-- Player cache: incremental updates + slow reconcile (never stale, never rebuilt per frame).
+	local function RebuildPlayerCache()
+		PlayerCache = {}
+		for _, p in next, GetPlayers(Players) do
+			PlayerCache[#PlayerCache + 1] = p
+		end
+		PlayerCacheTime = tick()
+	end
+	RebuildPlayerCache()
+	RefreshFriends()
+	ServiceConnections.PlayerAdded = Connect(__index(Players, "PlayerAdded"), LPH_NO_VIRTUALIZE(function(Player)
+		PlayerCache[#PlayerCache + 1] = Player
+	end))
+	ServiceConnections.PlayerRemoving = Connect(__index(Players, "PlayerRemoving"), LPH_NO_VIRTUALIZE(function(Player)
+		for i, p in next, PlayerCache do
+			if p == Player then
+				tableremove(PlayerCache, i)
+				break
+			end
+		end
+		local id
+		pcall(function() id = __index(Player, "UserId") end)
+		if id ~= nil then
+			PurgePlayer(id)
+		end
+	end))
+	-- Slow friend-list refresh (amortized, not per frame).
+	ServiceConnections.FriendRefresh = Connect(__index(RunService, UpdateMode), LPH_NO_VIRTUALIZE(function()
+		if (tick() - FriendSetTime) > 120 then
+			RefreshFriends()
+		end
+		if (tick() - PlayerCacheTime) > (Environment.Performance.PlayerReconcile or 2) then
+			RebuildPlayerCache()
+		end
+		-- Ping sampling + auto-calibration run on slow gates. No extra loops.
+		local Nw = Environment.Network
+		if Nw ~= nil and Nw.PingPrediction ~= false and (tick() - PingState.LastUpdate) >= (Nw.PingUpdateRate or 0.25) then
+			SamplePing()
+		end
+		if (tick() - (PingState.LastCalib or 0)) >= 1 then
+			PingState.LastCalib = tick()
+			UpdateCalibration()
+		end
+	end))
+
+	if mouse1press and mouse1release then
+		ServiceConnections.Triggerbot = Connect(__index(RunService, UpdateMode), LPH_NO_VIRTUALIZE(function()
+			if Triggerbot.Enabled and Mouse.Target and not Environment.UISuppressAim then
+				if TriggerBusy then
+					return -- debounce: previous click cycle still in flight
+				end
+				if (osclock() - TriggerLastClick) < (Triggerbot.Cooldown or 0.25) then
+					return
+				end
+				local Character = Mouse.Target.Parent
+				local Humanoid = FindFirstChildOfClass(Character, "Humanoid")
+				local Player = GetPlayerFromCharacter(Players, Character)
+
+				if Character and Humanoid and Player then
+					if Triggerbot.TeamCheck and IsTeammate(Player) then
+						return
+					end
+
+					if Triggerbot.AliveCheck and __index(Humanoid, "Health") <= 0 then
+						return
+					end
+
+					if Triggerbot.AimLockedCheck and not Environment.Locked then
+						return
+					end
+
+					TriggerBusy = true
+					TriggerLastClick = osclock()
+					if Triggerbot.Delay ~= 0 then
+						taskwait(Triggerbot.Delay)
+					end
+
+					mouse1press(); taskwait(0); mouse1release()
+					TriggerBusy = false
+				end
+			end
+		end))
+	end
+
+	ServiceConnections.UpdateTracer = Connect(__index(RunService, UpdateMode), LPH_NO_VIRTUALIZE(function()
+		-- Uses the shared scan cache; no independent player loop.
+		local now = tick()
+		local ClosestPlayer = nil
+		if TracerSettings.Enabled and Settings.Enabled then
+			if (now - ScanState.Time) >= (Environment.Performance.TargetScanRate or 0.12) then
+				RefreshScan()
+			end
+			ClosestPlayer = ScanState.Best
+		end
+
+		if ClosestPlayer then
+			setrenderproperty(Tracer, "Visible", true)
+
+			for Index, Value in next, TracerSettings do
+				if Index == "Color" then
+					continue
+				end
+
+				if pcall(getrenderproperty, Tracer, Index) then
+					setrenderproperty(Tracer, Index, Value)
+				end
+			end
+
+			setrenderproperty(Tracer, "Color", TracerSettings.RainbowColor and GetRainbowColor() or TracerSettings.Color)
+
+			if TracerSettings.Position == 1 then
+				setrenderproperty(Tracer, "From", Vector2new(CameraViewportSize.X / 2, CameraViewportSize.Y))
+			elseif TracerSettings.Position == 2 then
+				setrenderproperty(Tracer, "From", CameraViewportSize / 2)
+			elseif TracerSettings.Position == 3 then
+				setrenderproperty(Tracer, "From", GetMouseLocation(UserInputService))
+			else
+				TracerSettings.Position = 3
+			end
+
+			local charOk, char = pcall(function() return __index(ClosestPlayer, "Character") end)
+			if charOk and char ~= nil then
+				local _, partPos = ResolveAimPart(char)
+				if partPos ~= nil then
+					setrenderproperty(Tracer, "To", ConvertVector(WorldToViewportPoint(Camera, partPos)))
+				end
+			end
+		else
+			setrenderproperty(Tracer, "Visible", false)
+		end
+	end))
+
+	ServiceConnections.RenderSteppedConnection = Connect(__index(RunService, UpdateMode), LPH_NO_VIRTUALIZE(function(DeltaTime)
+		if FOVSettings.Enabled and Settings.Enabled then
+			for Index, Value in next, FOVSettings do
+				if Index == "Color" or Index == "ShowLockRadius" or Index == "LockRadiusColor" then
+					continue
+				end
+
+				if pcall(getrenderproperty, FOVCircle, Index) then
+					setrenderproperty(FOVCircle, Index, Value)
+					setrenderproperty(FOVCircleOutline, Index, Value)
+				end
+			end
+
+			setrenderproperty(FOVCircle, "Color", (Environment.Locked and FOVSettings.LockedColor) or FOVSettings.RainbowColor and GetRainbowColor() or FOVSettings.Color)
+			setrenderproperty(FOVCircleOutline, "Color", FOVSettings.RainbowOutlineColor and GetRainbowColor() or FOVSettings.OutlineColor)
+
+			setrenderproperty(FOVCircleOutline, "Thickness", FOVSettings.Thickness + 1)
+			setrenderproperty(FOVCircle, "Position", GetMouseLocation(UserInputService))
+			setrenderproperty(FOVCircleOutline, "Position", GetMouseLocation(UserInputService))
+
+			-- Lock-retention ring (render only; never participates in targeting logic).
+			local LockRing = Environment.LockRadiusCircle
+			if FOVSettings.ShowLockRadius and LockRing ~= nil then
+				setrenderproperty(LockRing, "Visible", FOVSettings.Visible ~= false)
+				setrenderproperty(LockRing, "Radius", LockMeta.RetainRadius or Settings.LockRetentionRadius or 30)
+				setrenderproperty(LockRing, "Color", FOVSettings.LockRadiusColor or Color3fromRGB(255, 150, 150))
+				setrenderproperty(LockRing, "Thickness", 1)
+				setrenderproperty(LockRing, "Transparency", 0.5)
+				setrenderproperty(LockRing, "Filled", false)
+				setrenderproperty(LockRing, "NumSides", FOVSettings.NumSides or 60)
+				setrenderproperty(LockRing, "Position", GetMouseLocation(UserInputService))
+			elseif LockRing ~= nil then
+				setrenderproperty(LockRing, "Visible", false)
+			end
+		else
+			setrenderproperty(FOVCircle, "Visible", false)
+			setrenderproperty(FOVCircleOutline, "Visible", false)
+			if Environment.LockRadiusCircle ~= nil then
+				setrenderproperty(Environment.LockRadiusCircle, "Visible", false)
+			end
+		end
+
+		if Running and Settings.Enabled and not Environment.UISuppressAim then
+			GetClosestPlayer()
+
+			if Environment.Locked then
+				-- Lifecycle gate: validate BEFORE prediction. A dead/invalid target
+				-- must never produce a single velocity sample or predicted position.
+				-- (GetClosestPlayer already hard-cancels; this is the aim-path guard
+				-- for the same frame. `return` only skips this frame's callback.)
+				local hardReason = LockDeathReason()
+				if hardReason ~= nil then
+					DebugLockRelease(hardReason)
+					CancelLock()
+					return
+				end
+				local Character = __index(Environment.Locked, "Character")
+				if Character == nil then
+					CancelLock()
+				else
+					local AimPart, PartPos = ResolveAimPart(Character)
+					if AimPart == nil or PartPos == nil then
+						CancelLock()
+					else
+						-- Position sanity BEFORE any velocity/prediction work.
+						local sane, saneReason = CheckPositionSanity(PartPos, DeltaTime)
+						if not sane then
+							local prevTxt = "none"
+							if LockMeta.PrevPos ~= nil then
+								prevTxt = string.format("(%.1f, %.1f, %.1f)", LockMeta.PrevPos.X, LockMeta.PrevPos.Y, LockMeta.PrevPos.Z)
+							end
+							DebugLockRelease(saneReason, string.format("POS (%.1f, %.1f, %.1f) PREV %s", PartPos.X, PartPos.Y, PartPos.Z, prevTxt))
+							CancelLock()
+							return
+						end
+						LockMeta.PrevPos = PartPos
+						LockMeta.PrevTime = tick()
+						-- Lock retention (explicit pipeline order): current screen
+						-- distance vs the SMALL retention radius. Prediction below
+						-- only runs for targets inside it; prediction never justifies
+						-- keeping a target that left the active aim region.
+						do
+							local okR, vecR, onR = pcall(function() return WorldToViewportPoint(Camera, PartPos) end)
+							if not okR or not onR then
+								CancelLock()
+								return
+							end
+							local sdNow = (GetMouseLocation(UserInputService) - ConvertVector(vecR)).Magnitude
+							if sdNow > (LockMeta.RetainRadius or Settings.LockRetentionRadius or 30) then
+								DebugLockRelease("LOCK_RADIUS_EXIT")
+								CancelLock()
+								return
+							end
+						end
+						local OffsetToMoveDirection = Settings.OffsetToMoveDirection
+						local OffsetValue = Vector3zero
+						if OffsetToMoveDirection then
+							local humOk, moveDir = pcall(function()
+								return __index(FindFirstChildOfClass(Character, "Humanoid"), "MoveDirection")
+							end)
+							if humOk and moveDir ~= nil then
+								OffsetValue = moveDir * (mathclamp(Settings.OffsetIncrement, 1, 30) / 10)
+							end
+						end
+
+						SampleVelocity(AimPart, DeltaTime or 0.016)
+
+						local camPos = __index(Camera, "CFrame").Position
+						local worldDist = (camPos - PartPos).Magnitude
+						local PredictedPos, Confidence = ComputePrediction(PartPos, worldDist)
+						PredictedPos = PredictedPos + OffsetValue
+
+						-- Calibration sampling: directional bias of the previous prediction
+						-- vs the actual position now. Sign only matters (over/undershoot);
+						-- magnitude is normalized and learning is clamped in UpdateCalibration.
+						do
+							local prev = PingState.LastPred
+							local sv = VelocityState.SmoothVel or VelocityState.AvgVelocity
+							if prev ~= nil and prev.Pos ~= nil and sv ~= nil and sv.Magnitude > 2 and Confidence > 0.3 then
+								local errVec = PartPos - prev.Pos
+								local bias = ((errVec.X * sv.Unit.X) + (errVec.Y * sv.Unit.Y) + (errVec.Z * sv.Unit.Z)) / (sv.Magnitude * 0.12 + 1)
+								local buf = PingState.ErrBuf
+								buf[#buf + 1] = mathclamp(bias, -2, 2)
+								local maxE = (Environment.Network and Environment.Network.ErrorSamples) or 10
+								while #buf > maxE do
+									tableremove(buf, 1)
+								end
+							end
+							PingState.LastPred = { Pos = PredictedPos }
+						end
+
+						-- Camera safety: a stale/NaN prediction never touches the camera.
+						-- (No Y-clamping workaround: the lifecycle fix above is the real
+						-- fix; this only guards against corrupt float state.)
+						if PredictedPos.X ~= PredictedPos.X or PredictedPos.Y ~= PredictedPos.Y or PredictedPos.Z ~= PredictedPos.Z
+							or mathabs(PredictedPos.X) > 100000 or mathabs(PredictedPos.Y) > 100000 or mathabs(PredictedPos.Z) > 100000 then
+							DebugLockRelease("Stale predicted position")
+							CancelLock()
+							return
+						end
+						local LockedScreen = WorldToViewportPoint(Camera, PredictedPos)
+						local mousePos = GetMouseLocation(UserInputService)
+						local errPx = (mousePos - ConvertVector(LockedScreen)).Magnitude
+
+						-- Final gate: re-validate immediately before touching the camera,
+						-- so a death in the microseconds since prediction can't pull aim.
+						local preCamReason = LockDeathReason()
+						if preCamReason ~= nil then
+							DebugLockRelease(preCamReason)
+							CancelLock()
+							return
+						end
+						-- Aim output: single dispatch. The shared pipeline above is
+						-- untouched; only this final stage differs per method. No
+						-- target / prediction reset happens here, so switching
+						-- methods mid-lock is seamless (no snap).
+						local alpha = ComputeSmoothing(DeltaTime or 0.016, errPx, worldDist)
+						AimController:Aim({
+							CamPos = camPos,
+							PredictedPos = PredictedPos,
+							ScreenPos = LockedScreen,
+							MousePos = mousePos,
+							Alpha = alpha
+						})
+						LastAimData.SX = LockedScreen.X
+						LastAimData.SY = LockedScreen.Y
+						LastAimData.PX = PredictedPos.X
+						LastAimData.PY = PredictedPos.Y
+						LastAimData.PZ = PredictedPos.Z
+						LastAimData.Method = Environment.Settings.AimbotMethod or "Camera"
+
+						setrenderproperty(FOVCircle, "Color", FOVSettings.LockedColor)
+						setrenderproperty(Tracer, "Visible", false)
+
+						DebugPrint("PRED " .. string.format("%.3f", (PredictedPos - PartPos).Magnitude) .. " CONF " .. string.format("%.2f", Confidence))
+					end
+				end
+			end
+		end
+	end))
+
+	ServiceConnections.InputBeganConnection = Connect(__index(UserInputService, "InputBegan"), LPH_NO_VIRTUALIZE(function(Input)
+		if Typing then
+			return
+		end
+
+		local TriggerKey, Toggle = Settings.TriggerKey, Settings.Toggle
+
+		if Input.UserInputType == Enum.UserInputType.Keyboard and Input.KeyCode == TriggerKey or Input.UserInputType == TriggerKey then
+			if Toggle then
+				Running = not Running
+
+				if not Running then
+					CancelLock()
+				end
+			else
+				Running = true
+			end
+		end
+	end))
+
+	ServiceConnections.InputEndedConnection = Connect(__index(UserInputService, "InputEnded"), LPH_NO_VIRTUALIZE(function(Input)
+		if Typing then
+			return
+		end
+
+		local TriggerKey = Settings.TriggerKey
+
+		if Input.UserInputType == Enum.UserInputType.Keyboard and Input.KeyCode == TriggerKey or Input.UserInputType == TriggerKey then
+			Running = false; CancelLock()
+		end
+	end))
+end
+
+--// Typing Check
+
+ServiceConnections.TypingStartedConnection = Connect(__index(UserInputService, "TextBoxFocused"), function()
+	Typing = true
+end)
+
+ServiceConnections.TypingEndedConnection = Connect(__index(UserInputService, "TextBoxFocusReleased"), function()
+	Typing = false
+end)
+
+--// Interactive User Methods
+
+repeat
+	taskwait(0)
+until Environment and Load
+
+Environment.Exit = LPH_NO_VIRTUALIZE(function(self) -- ExunysDeveloperAimbot.Exit(self)
+	assert(self, "EXUNYS_AIMBOT-V3.Exit: Missing parameter #1 \"self\" <table>.")
+
+	for Index, _ in next, ServiceConnections do
+		pcall(Disconnect, ServiceConnections[Index])
+	end
+
+	PlayerCache = {}
+	VisibilityCache = {}
+	FriendSet = {}
+	ResetTargetState()
+	-- Full unload: connection-level network stats go too (respawn/target-change keeps them).
+	PingState.Raw = 0
+	PingState.Smoothed = 0
+	PingState.Min = 0
+	PingState.Max = 0
+	PingState.Jitter = 0
+	PingState.Samples = {}
+	PingState.Quality = "Unknown"
+	PingState.Correction = 1
+	PingState.ErrBuf = {}
+	PingState.LastPred = nil
+	PingState.Effective = 0
+	PingState.Available = false
+
+	Load = nil; ConvertVector = nil; CancelLock = nil; GetClosestPlayer = nil; GetRainbowColor = nil; FixUsername = nil
+	IsValidTarget = nil; RefreshScan = nil; ScoreTarget = nil; IsTeammate = nil
+
+	self.FOVCircle:Remove()
+	self.FOVCircleOutline:Remove()
+	self.Tracer:Remove()
+	if self.LockRadiusCircle ~= nil then
+		pcall(function() self.LockRadiusCircle:Remove() end)
+	end
+
+	getgenv().ExunysDeveloperAimbot = nil; pcall(collectgarbage, "step", 200)
+end)
+
+Environment.Panic = LPH_NO_VIRTUALIZE(function() -- ExunysDeveloperAimbot.Panic(<void>)
+	-- Emergency stop: aim loop halts (Running=false), lock + target state cleared,
+	-- prediction/smoothing stop with the lock, aimbot output disabled. UI stays alive.
+	Running = false
+	CancelLock()
+	Environment.Settings.Enabled = false
+end)
+
+Environment.Restart = LPH_NO_VIRTUALIZE(function() -- ExunysDeveloperAimbot.Restart(<void>)
+	for Index, _ in next, ServiceConnections do
+		pcall(Disconnect, ServiceConnections[Index])
+	end
+
+	Load()
+end)
+
+Environment.Blacklist = LPH_NO_VIRTUALIZE(function(self, Username) -- ExunysDeveloperAimbot.Blacklisted(self, <string> Player Name)
+	assert(self, "EXUNYS_AIMBOT-V3.Blacklist: Missing parameter #1 \"self\" <table>.")
+	assert(Username, "EXUNYS_AIMBOT-V3.Blacklist: Missing parameter #2 \"Username\" <string>.")
+
+	Username = FixUsername(Username)
+
+	assert(self, "EXUNYS_AIMBOT-V3.Blacklist: User "..Username.." couldn't be found.")
+
+	self.Blacklisted[#self.Blacklisted + 1] = Username
+end)
+
+Environment.Whitelist = LPH_NO_VIRTUALIZE(function(self, Username) -- ExunysDeveloperAimbot.Whitelist(self, <string> Player Name)
+	assert(self, "EXUNYS_AIMBOT-V3.Whitelist: Missing parameter #1 \"self\" <table>.")
+	assert(Username, "EXUNYS_AIMBOT-V3.Whitelist: Missing parameter #2 \"Username\" <string>.")
+
+	Username = FixUsername(Username)
+
+	assert(Username, "EXUNYS_AIMBOT-V3.Whitelist: User "..Username.." is not blacklisted.")
+
+	local Index = tablefind(self.Blacklisted, Username)
+
+	assert(Index, "EXUNYS_AIMBOT-V3.Whitelist: User "..Username.." is not blacklisted.")
+
+	tableremove(self.Blacklisted, Index)
+end)
+
+Environment.Prioritize = LPH_NO_VIRTUALIZE(function(self, Username) -- ExunysDeveloperAimbot.Prioritize(self, <string> Player Name)
+	assert(self, "EXUNYS_AIMBOT-V3.Prioritize: Missing parameter #1 \"self\" <table>.")
+	assert(Username, "EXUNYS_AIMBOT-V3.Prioritize: Missing parameter #2 \"Username\" <string>.")
+
+	Username = FixUsername(Username)
+
+	assert(Username, "EXUNYS_AIMBOT-V3.Prioritize: User "..Username.." couldn't be found.")
+
+	if not tablefind(self.PriorityPlayers, Username) then
+		self.PriorityPlayers[#self.PriorityPlayers + 1] = Username
+	end
+end)
+
+Environment.Deprioritize = LPH_NO_VIRTUALIZE(function(self, Username) -- ExunysDeveloperAimbot.Deprioritize(self, <string> Player Name)
+	assert(self, "EXUNYS_AIMBOT-V3.Deprioritize: Missing parameter #1 \"self\" <table>.")
+	assert(Username, "EXUNYS_AIMBOT-V3.Deprioritize: Missing parameter #2 \"Username\" <string>.")
+
+	local Index = tablefind(self.PriorityPlayers, Username)
+
+	if Index then
+		tableremove(self.PriorityPlayers, Index)
+	end
+end)
+
+Environment.GetClosestPlayer = LPH_NO_VIRTUALIZE(function() -- ExunysDeveloperAimbot.GetClosestPlayer(<void>)
+	return GetClosestPlayer(true)
+end)
+
+-- Developer scan: inspect the current game ONCE and report candidate team sources
+-- with confidence + evidence. Nothing is auto-enabled; configure TeamResolver
+-- manually from the results (Mode / ManualAttribute / ManualValuePath / adapter).
+Environment.ScanTeamSources = LPH_NO_VIRTUALIZE(function() -- ExunysDeveloperAimbot.ScanTeamSources(<void>)
+	AnalyzeSources(true)
+	local cfg = Environment.TeamResolver
+	_warn("[Aimbot] TEAM SCAN (mode " .. tostring(cfg.Mode) .. ", native-diverse: " .. tostring(TeamRanking.NativeDiverse) .. ")")
+	local function dump(title, list, show)
+		_warn("[Aimbot] Possible " .. title .. ":")
+		if #list < 1 then
+			_warn("   (none found)")
+			return
+		end
+		for i = 1, math.min(#list, show or 5) do
+			local e = list[i]
+			_warn("   " .. tostring(e.Key) .. " conf " .. string.format("%.2f", e.Conf) .. " distinct " .. tostring(e.Distinct))
+		end
+	end
+	dump("Team Attributes", TeamRanking.Attr)
+	dump("Values", TeamRanking.Value)
+	dump("Tags", TeamRanking.Tag)
+	local rec = "Native (meaningful)"
+	if not TeamRanking.NativeDiverse then
+		if #TeamRanking.Attr > 0 and TeamRanking.Attr[1].Conf >= (cfg.ConfidenceThreshold or 0.6) then
+			rec = "Attribute:" .. tostring(TeamRanking.Attr[1].Key)
+		elseif #TeamRanking.Value > 0 and TeamRanking.Value[1].Conf >= (cfg.ConfidenceThreshold or 0.6) then
+			rec = "Value:" .. tostring(TeamRanking.Value[1].Key)
+		elseif #TeamRanking.Tag > 0 and TeamRanking.Tag[1].Conf >= (cfg.ConfidenceThreshold or 0.6) then
+			rec = "Tag prefix:" .. tostring(TeamRanking.Tag[1].Key)
+		else
+			rec = "none confident - set ManualAttribute/ManualValuePath or a GameAdapter"
+		end
+	end
+	_warn("[Aimbot] Recommended source: " .. rec)
+	return { Attributes = TeamRanking.Attr, Values = TeamRanking.Value, Tags = TeamRanking.Tag, NativeDiverse = TeamRanking.NativeDiverse, Recommended = rec }
+end)
+
+Environment.GetTargetInfo = LPH_NO_VIRTUALIZE(function() -- ExunysDeveloperAimbot.GetTargetInfo(<void>)
+	local locked = Environment.Locked
+	local info = {
+		Target = nil,
+		Score = LockMeta.LastScore,
+		FOV = LastBreakdown.FOV,
+		Distance = LastBreakdown.Distance,
+		Visibility = LastBreakdown.Visibility,
+		Confidence = VelocityState.Confidence,
+		Velocity = VelocityState.AvgVelocity.Magnitude,
+		Stable = VelocityState.Stable,
+		EffTime = PingState.Effective or 0,
+		Ping = mathfloor(PingState.Smoothed or 0),
+		Network = PingState.Quality,
+		Method = LastAimData.Method,
+		ScreenX = LastAimData.SX,
+		ScreenY = LastAimData.SY,
+		PredX = LastAimData.PX,
+		PredY = LastAimData.PY,
+		PredZ = LastAimData.PZ
+	}
+	if locked ~= nil then
+		pcall(function() info.Target = __index(locked, "Name") end)
+	end
+	return info
+end)
+
+Environment.Load = Load -- ExunysDeveloperAimbot.Load()
+
+Environment.GetDiagnostics = LPH_NO_VIRTUALIZE(function() -- ExunysDeveloperAimbot.GetDiagnostics(<void>)
+	local lockedName = "none"
+	if Environment.Locked ~= nil then
+		pcall(function() lockedName = __index(Environment.Locked, "Name") end)
+	end
+	return {
+		Drawing = DrawingAvailable,
+		FriendAPI = not FriendAPIUnavailable,
+		PlayersCached = #PlayerCache,
+		Locked = lockedName,
+		Running = Running,
+		Enabled = Environment.Settings.Enabled,
+		TeamCheck = Environment.Settings.TeamCheck,
+		WallCheck = Environment.Settings.WallCheck,
+		Ping = mathfloor(PingState.Raw or 0),
+		SmoothedPing = mathfloor(PingState.Smoothed or 0),
+		Jitter = mathfloor(PingState.Jitter or 0),
+		Network = PingState.Quality,
+		EffTime = PingState.Effective or 0,
+		Correction = PingState.Correction or 1,
+		AcqFOV = Environment.FOVSettings.Radius or 180,
+		RetainRadius = LockMeta.RetainRadius or 0,
+		GracePeriod = Environment.Settings.TargetGracePeriod or 0.1,
+		TeamSource = (function()
+			local s, c, t = "?", 0, "?"
+			pcall(function()
+				local li = ResolveTeamInfo(LocalPlayer)
+				if li ~= nil then
+					s = tostring(li.Source or "?")
+					c = li.Confidence or 0
+				end
+				if Environment.Locked ~= nil then
+					local ti = ResolveTeamInfo(Environment.Locked)
+					if ti ~= nil and type(ti.TeamName) == "string" then
+						t = tostring(ti.TeamName)
+					end
+				end
+			end)
+			return s
+		end)(),
+		TeamConfidence = (function()
+			local c = 0
+			pcall(function()
+				local li = ResolveTeamInfo(LocalPlayer)
+				if li ~= nil then
+					c = li.Confidence or 0
+				end
+			end)
+			return c
+		end)(),
+		TargetTeam = (function()
+			local t = "?"
+			pcall(function()
+				if Environment.Locked ~= nil then
+					local ti = ResolveTeamInfo(Environment.Locked)
+					if ti ~= nil and type(ti.TeamName) == "string" then
+						t = tostring(ti.TeamName)
+					end
+				end
+			end)
+			return t
+		end)()
+	}
+end)
+
+setmetatable(Environment, {__call = Load})
+
+--// Auto-start: dosya direkt çalıştırılınca manuel Load() gerekmez.
+if Environment.DeveloperSettings.AutoStart ~= false then
+	if PreviousInstance ~= nil and type(PreviousInstance.Exit) == "function" then
+		pcall(function() PreviousInstance:Exit() end)
+		getgenv().ExunysDeveloperAimbot = Environment -- Exit slotu nilledi, geri koy.
+		dprint("previous instance exited (duplicate loops prevented)")
+	end
+	local okL, errL = pcall(function() Load() end)
+	if okL then
+		dprint("auto-started OK - hold", tostring(Environment.Settings.TriggerKey), "to aim")
+	else
+		warn("[Aimbot] auto-start failed: " .. tostring(errL) .. " - try manual: getgenv().ExunysDeveloperAimbot.Load()")
+	end
+else
+	dprint("chunk loaded OK. Start with: getgenv().ExunysDeveloperAimbot.Load()")
+end
+dprint("hold", tostring(Environment.Settings.TriggerKey), "to aim (Toggle =", tostring(Environment.Settings.Toggle) .. ")")
+dprint("tip: run GetDiagnostics() any time, or set Debugger.Enabled = true for live target stats")
+
+
+local Aimbot = Environment
+
+
+-- Spec default: aimbot starts OFF from the UI (file default is ON; UI takes over).
+pcall(function() Aimbot.Settings.Enabled = false end)
+
+-- Menu open state. While the menu is open, aiming is suspended so the mouse
+-- moves freely (UISuppressAim gates the aimbot's aim + trigger output only;
+-- visuals keep working). Declared early so the status loop below can read it.
+local UIIsOpen = true
+
+--// Value maps (UI labels -> exact aimbot setting values)
+
+local PriorityMap = {
+	["Best Score"] = "Score",
+	["Closest To Cursor"] = "ClosestToCursor",
+	["Closest Distance"] = "ClosestDistance",
+	["Lowest Health"] = "LowestHealth",
+	["Priority"] = "Priority",
+}
+local PriorityRev = {}
+for k, v in next, PriorityMap do PriorityRev[v] = k end
+
+local PartModeMap = {
+	["Head"] = { "Static", "Head" },
+	["UpperTorso"] = { "Static", "UpperTorso" },
+	["LowerTorso"] = { "Static", "LowerTorso" },
+	["HumanoidRootPart"] = { "Static", "HumanoidRootPart" },
+	["Torso"] = { "Static", "Torso" },
+	["Nearest Visible"] = { "ClosestVisible", nil },
+	["Custom"] = { "PriorityList", nil },
+}
+
+local TeamModeMap = {
+	["Auto"] = "Auto",
+	["Native Roblox"] = "Native",
+	["Custom Attribute"] = "Attributes",
+	["Value Object"] = "Values",
+	["Tags"] = "Tags",
+	["Game Adapter"] = "GameAdapter",
+	["Manual"] = "Manual",
+	["Disabled"] = "Disabled",
+}
+local TeamModeRev = {}
+for k, v in next, TeamModeMap do TeamModeRev[v] = k end
+
+local function Write(path, value)
+	local A = Aim()
+	if A == nil then
+		return
+	end
+	pcall(function()
+		if path == "Enabled" then A.Settings.Enabled = value
+		elseif path == "TriggerKey" then A.Settings.TriggerKey = value
+		elseif path == "Toggle" then A.Settings.Toggle = value
+		elseif path == "FOVEnabled" then A.FOVSettings.Enabled = value
+		elseif path == "Radius" then A.FOVSettings.Radius = value
+		elseif path == "FOVVisible" then A.FOVSettings.Visible = value
+		elseif path == "FOVColor" then A.FOVSettings.Color = value
+		elseif path == "FOVThickness" then A.FOVSettings.Thickness = value
+		elseif path == "FOVTransparency" then A.FOVSettings.Transparency = value
+		elseif path == "ShowLockRadius" then A.FOVSettings.ShowLockRadius = value
+		elseif path == "LockRadiusColor" then A.FOVSettings.LockRadiusColor = value
+		elseif path == "TeamCheck" then A.Settings.TeamCheck = value
+		elseif path == "TeamMode" then A.TeamResolver.Mode = value
+		elseif path == "UnknownBehavior" then A.TeamResolver.UnknownBehavior = value
+		elseif path == "FriendCheck" then A.Settings.FriendCheck = value
+		elseif path == "AliveCheck" then A.Settings.AliveCheck = value
+		elseif path == "WallCheck" then A.Settings.WallCheck = value
+		elseif path == "StrictVisibility" then A.Settings.StrictVisibility = value
+		elseif path == "PriorityMode" then A.Settings.PriorityMode = value
+		elseif path == "PartMode" then A.Settings.PartMode = value
+		elseif path == "LockPart" then A.Settings.LockPart = value
+		elseif path == "MaxDistance" then A.Settings.MaxDistance = value
+		elseif path == "LockRetentionRadius" then A.Settings.LockRetentionRadius = value
+		elseif path == "TargetStickiness" then A.Settings.TargetStickiness = value
+		elseif path == "SwitchThreshold" then A.Settings.SwitchThreshold = value
+		elseif path == "PingPrediction" then A.Network.PingPrediction = value
+		elseif path == "PingMultiplier" then A.Network.PingMultiplier = value
+		elseif path == "PingSmoothing" then A.Network.PingSmoothing = value
+		elseif path == "JitterCompensation" then A.Network.JitterCompensation = value
+		elseif path == "AutoCalibration" then A.Network.AutoCalibration = value
+		elseif path == "ConfidenceStrength" then A.Prediction.ConfidenceStrength = value
+		elseif path == "MinLatency" then A.Network.MinLatency = value
+		elseif path == "MaxLatency" then A.Network.MaxLatency = value
+		elseif path == "CalibrationStrength" then A.Network.CalibrationStrength = value
+		elseif path == "CalibrationRate" then A.Network.CalibrationRate = value
+		elseif path == "AdaptivePrediction" then A.Prediction.Adaptive = value
+		elseif path == "AdaptiveSmoothing" then A.Smoothing.Adaptive = value
+		elseif path == "SmoothMin" then A.Smoothing.Min = value
+		elseif path == "SmoothMax" then A.Smoothing.Max = value
+		elseif path == "SmoothError" then A.Smoothing.ErrorInfluence = value
+		elseif path == "SmoothDistance" then A.Smoothing.DistanceInfluence = value
+		elseif path == "SmoothVelocity" then A.Smoothing.VelocityInfluence = value
+		elseif path == "SmoothStability" then A.Smoothing.StabilityInfluence = value
+		elseif path == "Debugger" then A.Debugger.Enabled = value
+		elseif path == "AimbotMethod" then A.Settings.AimbotMethod = value
+		end
+	end)
+end
+
+--// LEFT: Aimbot groupbox
+
+local AimBox = Tabs.Main:AddLeftGroupbox("Aimbot")
+
+AimBox:AddToggle("AimbotEnabled", {
+	Text = "Enable Aimbot",
+	Default = false,
+	Tooltip = "Master switch. Writes Settings.Enabled (aimbot's own run gate).",
+	Callback = function(v) Write("Enabled", v) end,
+})
+
+AimBox:AddDropdown("AimbotMethod", {
+	Values = { "Camera", "Mouse" },
+	Default = "Camera",
+	Text = "Aimbot Method",
+	Tooltip = "Camera = CFrame aim. Mouse = cursor aim (camera untouched). Applies instantly, no restart; target and prediction state are kept.",
+	Callback = function(v) Write("AimbotMethod", (v == "Mouse") and "Mouse" or "Camera") end,
+})
+
+AimBox:AddLabel("Aim Key"):AddKeyPicker("AimKey", {
+	Default = "MB2",
+	Mode = "Hold",
+	Text = "Aim Key",
+	Tooltip = "Edits Settings.TriggerKey. Aiming itself is handled by the aimbot's own input listener.",
+	-- Functional listener stays the aimbot's single InputBegan/Ended pair; this callback is intentionally inert.
+	Callback = function() end,
+	ChangedCallback = function(newKey)
+		if newKey ~= nil then
+			Write("TriggerKey", newKey)
+		end
+	end,
+})
+
+AimBox:AddDropdown("AimMode", {
+	Values = { "Hold", "Toggle" },
+	Default = "Hold",
+	Text = "Aim Mode",
+	Tooltip = "Hold = aim while pressed. Toggle = press to latch.",
+	Callback = function(v) Write("Toggle", v == "Toggle") end,
+})
+
+AimBox:AddToggle("FOVEnabled", {
+	Text = "FOV Enabled",
+	Default = true,
+	Callback = function(v) Write("FOVEnabled", v) end,
+})
+
+AimBox:AddSlider("AcqFOV", {
+	Text = "Acquisition FOV",
+	Default = 180,
+	Min = 10,
+	Max = 500,
+	Rounding = 0,
+	Tooltip = "Where NEW targets may be selected. Applies live.",
+	Callback = function(v) Write("Radius", v) end,
+})
+
+AimBox:AddToggle("ShowFOV", {
+	Text = "Show FOV",
+	Default = true,
+	Callback = function(v) Write("FOVVisible", v) end,
+})
+
+AimBox:AddToggle("ShowLockRadius", {
+	Text = "Show Lock Radius",
+	Default = false,
+	Tooltip = "Second ring for the SMALL lock-retention radius (debug aid).",
+	Callback = function(v) Write("ShowLockRadius", v) end,
+})
+
+AimBox:AddLabel("FOV Color"):AddColorPicker("FOVColor", {
+	Default = Color3.fromRGB(255, 255, 255),
+	Title = "FOV Color",
+	Callback = function(c) Write("FOVColor", c) end,
+})
+
+AimBox:AddLabel("Lock Radius Color"):AddColorPicker("LockRadiusColor", {
+	Default = Color3.fromRGB(255, 150, 150),
+	Title = "Lock Radius Color",
+	Callback = function(c) Write("LockRadiusColor", c) end,
+})
+
+AimBox:AddSlider("FOVThickness", {
+	Text = "FOV Thickness",
+	Default = 1,
+	Min = 1,
+	Max = 5,
+	Rounding = 0,
+	Callback = function(v) Write("FOVThickness", v) end,
+})
+
+AimBox:AddSlider("FOVTransparency", {
+	Text = "FOV Transparency",
+	Default = 1,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Callback = function(v) Write("FOVTransparency", v) end,
+})
+
+--// LEFT: Filters groupbox (TeamResolver is controlled, never reimplemented)
+
+local FilterBox = Tabs.Main:AddLeftGroupbox("Filters")
+
+FilterBox:AddToggle("TeamCheck", {
+	Text = "Team Check",
+	Default = true,
+	Tooltip = "Same-team targets are never targeted. Uses the Universal Team Resolver.",
+	Callback = function(v) Write("TeamCheck", v) end,
+})
+
+FilterBox:AddDropdown("TeamDetectionMode", {
+	Values = { "Auto", "Native Roblox", "Custom Attribute", "Value Object", "Tags", "Game Adapter", "Manual", "Disabled" },
+	Default = "Auto",
+	Text = "Team Detection Mode",
+	Tooltip = "Which team source the resolver uses. Auto prefers meaningful native teams.",
+	Callback = function(v) Write("TeamMode", TeamModeMap[v] or "Auto") end,
+})
+
+FilterBox:AddDropdown("UnknownTeamBehavior", {
+	Values = { "Ignore", "Target" },
+	Default = "Ignore",
+	Text = "Unknown Team Behavior",
+	Tooltip = "UNKNOWN team = Ignore (strict, skip) or Target (permissive).",
+	Callback = function(v) Write("UnknownBehavior", v) end,
+})
+
+FilterBox:AddToggle("FriendCheck", {
+	Text = "Friend Check",
+	Default = true,
+	Callback = function(v) Write("FriendCheck", v) end,
+})
+
+FilterBox:AddToggle("AliveCheck", {
+	Text = "Alive Check",
+	Default = true,
+	Tooltip = "Dead targets are invalid. No separate death detector here.",
+	Callback = function(v) Write("AliveCheck", v) end,
+})
+
+FilterBox:AddToggle("VisibilityCheck", {
+	Text = "Visibility Check",
+	Default = true,
+	Tooltip = "Obstructed targets are rejected (strict) or scored lower.",
+	Callback = function(v) Write("WallCheck", v) end,
+})
+
+FilterBox:AddToggle("StrictVisibility", {
+	Text = "Strict Visibility",
+	Default = true,
+	Callback = function(v) Write("StrictVisibility", v) end,
+})
+
+--// LEFT: Smoothing groupbox
+
+local SmoothBox = Tabs.Main:AddLeftGroupbox("Smoothing")
+
+SmoothBox:AddToggle("AdaptiveSmoothing", {
+	Text = "Adaptive Smoothing",
+	Default = true,
+	Callback = function(v) Write("AdaptiveSmoothing", v) end,
+})
+
+SmoothBox:AddSlider("SmoothMin", {
+	Text = "Minimum Smoothing",
+	Default = 0.08,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Callback = function(v) Write("SmoothMin", v) end,
+})
+
+SmoothBox:AddSlider("SmoothMax", {
+	Text = "Maximum Smoothing",
+	Default = 0.9,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Callback = function(v) Write("SmoothMax", v) end,
+})
+
+SmoothBox:AddSlider("SmoothError", {
+	Text = "Aim Error Influence",
+	Default = 0.6,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Callback = function(v) Write("SmoothError", v) end,
+})
+
+SmoothBox:AddSlider("SmoothDistance", {
+	Text = "Distance Influence",
+	Default = 0.2,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Callback = function(v) Write("SmoothDistance", v) end,
+})
+
+SmoothBox:AddSlider("SmoothVelocity", {
+	Text = "Velocity Influence",
+	Default = 0.3,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Callback = function(v) Write("SmoothVelocity", v) end,
+})
+
+SmoothBox:AddSlider("SmoothStability", {
+	Text = "Stability Influence",
+	Default = 0.4,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Callback = function(v) Write("SmoothStability", v) end,
+})
+
+--// RIGHT: Targeting groupbox
+
+local TargetBox = Tabs.Main:AddRightGroupbox("Targeting")
+
+TargetBox:AddDropdown("TargetSelection", {
+	Values = { "Best Score", "Closest To Cursor", "Closest Distance", "Lowest Health", "Priority" },
+	Default = "Best Score",
+	Text = "Target Selection",
+	Callback = function(v) Write("PriorityMode", PriorityMap[v] or "Score") end,
+})
+
+TargetBox:AddDropdown("TargetPart", {
+	Values = { "Head", "UpperTorso", "LowerTorso", "HumanoidRootPart", "Torso", "Nearest Visible", "Custom" },
+	Default = "Head",
+	Text = "Target Part",
+	Tooltip = "Named parts aim statically; Nearest Visible scores visible parts; Custom uses the aimbot's TargetParts priority list.",
+	Callback = function(v)
+		local m = PartModeMap[v]
+		if m ~= nil then
+			if v == "Nearest Visible" then
+				Write("PartMode", "ClosestVisible")
+			elseif v == "Custom" then
+				Write("PartMode", "PriorityList")
+			else
+				Write("PartMode", m[1])
+				Write("LockPart", m[2])
+			end
+		end
+	end,
+})
+
+local SavedMaxDist = 1000
+TargetBox:AddToggle("UseDistanceLimit", {
+	Text = "Use Distance Limit",
+	Default = true,
+	Callback = function(v)
+		local A = Aim()
+		if A == nil then
+			return
+		end
+		if v then
+			Write("MaxDistance", SavedMaxDist)
+		else
+			pcall(function() SavedMaxDist = A.Settings.MaxDistance end)
+			Write("MaxDistance", 100000)
+		end
+	end,
+})
+
+TargetBox:AddSlider("MaxDistance", {
+	Text = "Max Distance",
+	Default = 1000,
+	Min = 0,
+	Max = 5000,
+	Rounding = 0,
+	Suffix = "st",
+	Callback = function(v)
+		SavedMaxDist = v
+		Write("MaxDistance", v)
+	end,
+})
+
+TargetBox:AddSlider("LockRetention", {
+	Text = "Lock Retention Radius",
+	Default = 30,
+	Min = 5,
+	Max = 200,
+	Rounding = 0,
+	Tooltip = "Small radius that keeps the CURRENT lock. Applies to the next lock (anchored at acquisition). Never equals acquisition FOV automatically.",
+	Callback = function(v) Write("LockRetentionRadius", v) end,
+})
+
+local SavedStick = 0.5
+TargetBox:AddToggle("EnableStickiness", {
+	Text = "Enable Stickiness",
+	Default = true,
+	Tooltip = "Stickiness only chooses BETWEEN valid targets; it never overrides hard validity.",
+	Callback = function(v)
+		if v then
+			Write("TargetStickiness", SavedStick)
+		else
+			local A = Aim()
+			if A ~= nil then
+				pcall(function() SavedStick = A.Settings.TargetStickiness end)
+			end
+			Write("TargetStickiness", 0)
+		end
+	end,
+})
+
+TargetBox:AddSlider("StickinessStrength", {
+	Text = "Stickiness Strength",
+	Default = 0.5,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Callback = function(v)
+		SavedStick = v
+		Write("TargetStickiness", v)
+	end,
+})
+
+TargetBox:AddSlider("SwitchThreshold", {
+	Text = "Switch Threshold",
+	Default = 0.12,
+	Min = 0,
+	Max = 0.5,
+	Rounding = 2,
+	Tooltip = "A challenger must beat the current target by this much to steal the lock.",
+	Callback = function(v) Write("SwitchThreshold", v) end,
+})
+
+--// RIGHT: Prediction groupbox (writes only; math stays in the aimbot)
+
+local PredBox = Tabs.Main:AddRightGroupbox("Prediction")
+
+PredBox:AddToggle("PredictionMaster", {
+	Text = "Ping Prediction",
+	Default = true,
+	Tooltip = "Master switch: latency-derived prediction time. OFF falls back to legacy paths.",
+	Callback = function(v) Write("PingPrediction", v) end,
+})
+
+PredBox:AddToggle("AdaptivePrediction", {
+	Text = "Adaptive Prediction",
+	Default = true,
+	Tooltip = "Legacy velocity-adaptive path (used when ping is unavailable).",
+	Callback = function(v) Write("AdaptivePrediction", v) end,
+})
+
+PredBox:AddSlider("PingMultiplier", {
+	Text = "Ping Multiplier",
+	Default = 1,
+	Min = 0.5,
+	Max = 1.5,
+	Rounding = 2,
+	Callback = function(v) Write("PingMultiplier", v) end,
+})
+
+PredBox:AddToggle("PingSmoothing", {
+	Text = "Ping Smoothing",
+	Default = true,
+	Callback = function(v) Write("PingSmoothing", v) end,
+})
+
+PredBox:AddToggle("JitterCompensation", {
+	Text = "Jitter Compensation",
+	Default = true,
+	Callback = function(v) Write("JitterCompensation", v) end,
+})
+
+PredBox:AddToggle("AutoCalibration", {
+	Text = "Auto Calibration",
+	Default = true,
+	Tooltip = "Slow self-correction of overshoot/undershoot bias.",
+	Callback = function(v) Write("AutoCalibration", v) end,
+})
+
+PredBox:AddSlider("PredictionStrength", {
+	Text = "Prediction Strength",
+	Default = 0.6,
+	Min = 0,
+	Max = 1,
+	Rounding = 2,
+	Tooltip = "How strongly prediction confidence scales the lead (ConfidenceStrength).",
+	Callback = function(v) Write("ConfidenceStrength", v) end,
+})
+
+PredBox:AddSlider("MinPrediction", {
+	Text = "Min Prediction",
+	Default = 0.02,
+	Min = 0,
+	Max = 0.2,
+	Rounding = 3,
+	Tooltip = "Floor for the latency-derived lead (Network.MinLatency).",
+	Callback = function(v) Write("MinLatency", v) end,
+})
+
+PredBox:AddSlider("MaxPrediction", {
+	Text = "Max Prediction",
+	Default = 0.3,
+	Min = 0.05,
+	Max = 0.5,
+	Rounding = 2,
+	Tooltip = "Ceiling for the latency-derived lead (Network.MaxLatency).",
+	Callback = function(v) Write("MaxLatency", v) end,
+})
+
+PredBox:AddSlider("CalibrationStrength", {
+	Text = "Calibration Strength",
+	Default = 1,
+	Min = 0,
+	Max = 2,
+	Rounding = 2,
+	Callback = function(v) Write("CalibrationStrength", v) end,
+})
+
+PredBox:AddSlider("LearningRate", {
+	Text = "Learning Rate",
+	Default = 0.05,
+	Min = 0,
+	Max = 0.2,
+	Rounding = 3,
+	Callback = function(v) Write("CalibrationRate", v) end,
+})
+
+--// RIGHT: Utility groupbox (panic, reset, status)
+
+local UtilBox = Tabs.Main:AddRightGroupbox("Utility")
+
+UtilBox:AddButton({
+	Text = "Panic / Stop Aimbot",
+	Func = function()
+		local A = Aim()
+		if A ~= nil and type(A.Panic) == "function" then
+			pcall(function() A.Panic() end)
+			pcall(function() Options.AimbotEnabled:SetValue(false) end)
+			Notify("Panic: aimbot disabled, lock cleared.")
+		else
+			Notify("Panic unavailable (aimbot missing).")
+		end
+	end,
+}):AddKeyPicker("PanicKey", {
+	Default = "F8",
+	Text = "Panic",
+	Mode = "Press",
+	Callback = function()
+		local A = Aim()
+		if A ~= nil and type(A.Panic) == "function" then
+			pcall(function() A.Panic() end)
+			pcall(function() Options.AimbotEnabled:SetValue(false) end)
+		end
+	end,
+})
+
+UtilBox:AddLabel("Toggle Aimbot"):AddKeyPicker("ToggleAimbotKey", {
+	Default = "F7",
+	Text = "Toggle Aimbot",
+	Mode = "Press",
+	Callback = function()
+		pcall(function()
+			Options.AimbotEnabled:SetValue(not Options.AimbotEnabled.Value)
+		end)
+	end,
+})
+
+local DEFAULTS = {
+	Enabled = false, AimbotMethod = "Camera", TriggerKey = "MB2", Toggle = false,
+	FOVEnabled = true, Radius = 180, FOVVisible = true,
+	FOVColor = Color3.fromRGB(255, 255, 255), FOVThickness = 1, FOVTransparency = 1,
+	ShowLockRadius = false, LockRadiusColor = Color3.fromRGB(255, 150, 150),
+	TeamCheck = true, TeamMode = "Auto", UnknownBehavior = "Ignore",
+	FriendCheck = true, AliveCheck = true, WallCheck = true, StrictVisibility = true,
+	PriorityMode = "Score", PartMode = "Static", LockPart = "Head",
+	MaxDistance = 1000, LockRetentionRadius = 30,
+	TargetStickiness = 0.5, SwitchThreshold = 0.12,
+	PingPrediction = true, PingMultiplier = 1, PingSmoothing = true,
+	JitterCompensation = true, AutoCalibration = true,
+	ConfidenceStrength = 0.6, MinLatency = 0.02, MaxLatency = 0.3,
+	CalibrationStrength = 1, CalibrationRate = 0.05,
+	AdaptivePrediction = true, AdaptiveSmoothing = true,
+	SmoothMin = 0.08, SmoothMax = 0.9, SmoothError = 0.6,
+	SmoothDistance = 0.2, SmoothVelocity = 0.3, SmoothStability = 0.4,
+}
+
+UtilBox:AddButton({
+	Text = "Reset Aimbot Settings",
+	Func = function()
+		local A = Aim()
+		if A == nil then
+			Notify("Reset failed: aimbot missing.")
+			return
+		end
+		pcall(function()
+			A.Settings.Enabled = false
+			A.Settings.Toggle = false
+			A.Settings.AimbotMethod = "Camera"
+			A.Settings.TriggerKey = Enum.UserInputType.MouseButton2
+			A.FOVSettings.Enabled = true
+			A.FOVSettings.Radius = 180
+			A.FOVSettings.Visible = true
+			A.FOVSettings.Color = DEFAULTS.FOVColor
+			A.FOVSettings.Thickness = 1
+			A.FOVSettings.Transparency = 1
+			A.FOVSettings.ShowLockRadius = false
+			A.FOVSettings.LockRadiusColor = DEFAULTS.LockRadiusColor
+			A.Settings.TeamCheck = true
+			A.TeamResolver.Mode = "Auto"
+			A.TeamResolver.UnknownBehavior = "Ignore"
+			A.Settings.FriendCheck = true
+			A.Settings.AliveCheck = true
+			A.Settings.WallCheck = true
+			A.Settings.StrictVisibility = true
+			A.Settings.PriorityMode = "Score"
+			A.Settings.PartMode = "Static"
+			A.Settings.LockPart = "Head"
+			A.Settings.MaxDistance = 1000
+			A.Settings.LockRetentionRadius = 30
+			A.Settings.TargetStickiness = 0.5
+			A.Settings.SwitchThreshold = 0.12
+			A.Network.PingPrediction = true
+			A.Network.PingMultiplier = 1
+			A.Network.PingSmoothing = true
+			A.Network.JitterCompensation = true
+			A.Network.AutoCalibration = true
+			A.Prediction.ConfidenceStrength = 0.6
+			A.Network.MinLatency = 0.02
+			A.Network.MaxLatency = 0.3
+			A.Network.CalibrationStrength = 1
+			A.Network.CalibrationRate = 0.05
+			A.Prediction.Adaptive = true
+			A.Smoothing.Adaptive = true
+			A.Smoothing.Min = 0.08
+			A.Smoothing.Max = 0.9
+			A.Smoothing.ErrorInfluence = 0.6
+			A.Smoothing.DistanceInfluence = 0.2
+			A.Smoothing.VelocityInfluence = 0.3
+			A.Smoothing.StabilityInfluence = 0.4
+		end)
+		SavedMaxDist = 1000
+		SavedStick = 0.5
+		local function sync(idx, val)
+			pcall(function() Options[idx]:SetValue(val) end)
+		end
+		sync("AimbotEnabled", false)
+		sync("AimbotMethod", "Camera")
+		sync("AimKey", { "MB2", "Hold" })
+		sync("AimMode", "Hold")
+		sync("FOVEnabled", true)
+		sync("AcqFOV", 180)
+		sync("ShowFOV", true)
+		sync("ShowLockRadius", false)
+		pcall(function() Options.FOVColor:SetValueRGB(DEFAULTS.FOVColor) end)
+		pcall(function() Options.LockRadiusColor:SetValueRGB(DEFAULTS.LockRadiusColor) end)
+		sync("FOVThickness", 1)
+		sync("FOVTransparency", 1)
+		sync("TeamCheck", true)
+		sync("TeamDetectionMode", "Auto")
+		sync("UnknownTeamBehavior", "Ignore")
+		sync("FriendCheck", true)
+		sync("AliveCheck", true)
+		sync("VisibilityCheck", true)
+		sync("StrictVisibility", true)
+		sync("TargetSelection", "Best Score")
+		sync("TargetPart", "Head")
+		sync("UseDistanceLimit", true)
+		sync("MaxDistance", 1000)
+		sync("LockRetention", 30)
+		sync("EnableStickiness", true)
+		sync("StickinessStrength", 0.5)
+		sync("SwitchThreshold", 0.12)
+		sync("PredictionMaster", true)
+		sync("AdaptivePrediction", true)
+		sync("PingMultiplier", 1)
+		sync("PingSmoothing", true)
+		sync("JitterCompensation", true)
+		sync("AutoCalibration", true)
+		sync("PredictionStrength", 0.6)
+		sync("MinPrediction", 0.02)
+		sync("MaxPrediction", 0.3)
+		sync("CalibrationStrength", 1)
+		sync("LearningRate", 0.05)
+		sync("AdaptiveSmoothing", true)
+		sync("SmoothMin", 0.08)
+		sync("SmoothMax", 0.9)
+		sync("SmoothError", 0.6)
+		sync("SmoothDistance", 0.2)
+		sync("SmoothVelocity", 0.3)
+		sync("SmoothStability", 0.4)
+		Notify("Aimbot settings reset to defaults.")
+	end,
+})
+
+local StatusLabel = UtilBox:AddLabel("Aimbot: OFF | Target: None")
+
+--// DEBUG TAB (throttled reads of existing public APIs only)
+
+local DbgBox = Tabs.Debug:AddLeftGroupbox("Target")
+local DbgTarget = DbgBox:AddLabel("Target: None")
+local DbgTeam = DbgBox:AddLabel("Team: -")
+local DbgFOV = DbgBox:AddLabel("FOV: -")
+
+local NetBox = Tabs.Debug:AddRightGroupbox("Network")
+local NetLbl = NetBox:AddLabel("Ping: -")
+local PredLbl = NetBox:AddLabel("Prediction: -")
+local ChecksLbl = NetBox:AddLabel("Checks: -")
+
+DbgBox:AddToggle("AimbotDebugger", {
+	Text = "Aimbot Print Debugger",
+	Default = false,
+	Tooltip = "Enables the aimbot's own throttled console debug (Debugger.Enabled).",
+	Callback = function(v) Write("Debugger", v) end,
+})
+
+DbgBox:AddButton({
+	Text = "Scan Team Sources",
+	Func = function()
+		local A = Aim()
+		if A ~= nil and type(A.ScanTeamSources) == "function" then
+			pcall(function() A.ScanTeamSources() end)
+		else
+			Notify("ScanTeamSources unavailable.")
+		end
+	end,
+})
+
+local function SetLabel(lbl, text)
+	local ok = pcall(function() lbl:SetText(text) end)
+	if not ok then
+		pcall(function() lbl.Text = text end)
+	end
+end
+
+task.spawn(function()
+	while true do
+		task.wait(0.3)
+		local A = Aim()
+		if A == nil then
+			break
+		end
+		local okI, info = pcall(function() return A.GetTargetInfo() end)
+		local okD, diag = pcall(function() return A.GetDiagnostics() end)
+		if okI and type(info) == "table" then
+			local tname = info.Target or "None"
+			SetLabel(DbgTarget, "Target: " .. tostring(tname) .. "  Score " .. string.format("%.2f", info.Score or -1))
+			SetLabel(DbgFOV, "Eff " .. string.format("%.3f", info.EffTime or 0) .. "s  Conf " .. string.format("%d%%", math.floor((info.Confidence or 0) * 100)))
+			SetLabel(PredLbl, "Prediction: " .. string.format("%.3fs", info.EffTime or 0) .. "  Vel " .. string.format("%.1f", info.Velocity or 0) .. "  Stable " .. tostring(info.Stable))
+		end
+		if okD and type(diag) == "table" then
+			SetLabel(StatusLabel, "Aimbot: " .. (tostring((A.Settings.Enabled and "ON") or "OFF")) .. " | Target: " .. tostring((okI and info.Target) or "None") .. (UIIsOpen and " | UI OPEN (aim paused)" or "") .. " | Method: " .. tostring((okI and info.Method) or (A.Settings.AimbotMethod or "Camera")))
+			SetLabel(DbgTeam, "Team: " .. tostring(diag.TargetTeam or "-") .. " | Src " .. tostring(diag.TeamSource or "?") .. " " .. string.format("%.2f", diag.TeamConfidence or 0))
+			SetLabel(NetLbl, "Ping: " .. tostring(diag.Ping or 0) .. "ms / " .. tostring(diag.SmoothedPing or 0) .. "ms  Jit " .. tostring(diag.Jitter or 0) .. "ms  " .. tostring(diag.Network or "?"))
+			SetLabel(ChecksLbl, "TeamCheck:" .. tostring(diag.TeamCheck) .. " Wall:" .. tostring(diag.WallCheck) .. " FPS-src Retain:" .. tostring(diag.RetainRadius or 0) .. " | Method: " .. tostring((okI and info.Method) or "?"))
+		end
+	end
+end)
+
+--// UI SETTINGS TAB (menu + config persistence via Obsidian SaveManager)
+
+local MenuBox = Tabs["UI Settings"]:AddLeftGroupbox("Menu")
+MenuBox:AddToggle("KeybindMenuOpen", {
+	Default = (Library.KeybindFrame ~= nil and Library.KeybindFrame.Visible) or false,
+	Text = "Open Keybind Menu",
+	Callback = function(v)
+		if Library.KeybindFrame ~= nil then
+			Library.KeybindFrame.Visible = v
+		end
+	end,
+})
+MenuBox:AddDropdown("NotificationSide", {
+	Values = { "Left", "Right" },
+	Default = "Right",
+	Text = "Notification Side",
+	Callback = function(v) Library:SetNotifySide(v) end,
+})
+MenuBox:AddDropdown("DPIDropdown", {
+	Values = { "50%", "75%", "100%", "125%", "150%", "175%", "200%" },
+	Default = "100%",
+	Text = "DPI Scale",
+	Callback = function(v)
+		v = v:gsub("%%", "")
+		Library:SetDPIScale(tonumber(v))
+	end,
+})
+local function setUIOpen(open)
+	UIIsOpen = open and true or false
+	local A = Aim()
+	if A ~= nil then
+		pcall(function() A.UISuppressAim = not UIIsOpen end)
+	end
+	pcall(function() Window:Toggle(UIIsOpen) end)
+end
+MenuBox:AddLabel("Menu bind"):AddKeyPicker("MenuKeybind", {
+	Default = "RightShift",
+	NoUI = true,
+	Text = "Menu keybind",
+	Mode = "Press",
+	Tooltip = "Opens/closes the menu. While open, aiming is suspended so the mouse moves freely.",
+	Callback = function() setUIOpen(not UIIsOpen) end,
+})
+setUIOpen(true)
+
+pcall(function()
+	SaveManager:SetLibrary(Library)
+	SaveManager:IgnoreThemeSettings()
+	SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
+	SaveManager:SetFolder("UniversalAimbot")
+	SaveManager:BuildConfigSection(Tabs["UI Settings"])
+	SaveManager:LoadAutoloadConfig()
+end)
+
+Notify("Aimbot UI loaded. Aimbot starts OFF; enable it in Main.")

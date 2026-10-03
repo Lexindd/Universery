@@ -1,0 +1,988 @@
+-- UniversalToolkit Executor Loader (tek dosya, Phase 2)
+-- Kullanım: executor'a yapıştır ve çalıştır. require/ModuleScript gerekmez.
+-- Bağımlılık: loadstring + game:HttpGet (executor). MacLib yoksa menü açılmaz ama hata vermez.
+-- Not: test edilmedi olarak kabul et.
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService")
+local LocalPlayer = Players.LocalPlayer
+
+-- Basit bağlantı yöneticisi (merkezi temizlik için)
+local Conns = {}
+local function track(key, conn)
+	if Conns[key] ~= nil then
+		pcall(function() Conns[key]:Disconnect() end)
+	end
+	Conns[key] = conn
+	return conn
+end
+local function untrackAll()
+	for k, c in pairs(Conns) do
+		pcall(function() c:Disconnect() end)
+		Conns[k] = nil
+	end
+end
+
+-- Orijinalleri sakla (restore için)
+local Originals = {}
+do
+	local char = LocalPlayer and LocalPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum ~= nil then
+		Originals.WalkSpeed = hum.WalkSpeed
+		Originals.JumpPower = hum.JumpPower
+	end
+	local cam = Workspace.CurrentCamera
+	if cam ~= nil then
+		Originals.FOV = cam.FieldOfView
+	end
+end
+if LocalPlayer ~= nil then
+	track("CharAdded", LocalPlayer.CharacterAdded:Connect(function()
+		task.defer(function()
+			task.wait(0.5)
+			local char = LocalPlayer.Character
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if hum ~= nil then
+				if Originals.WalkSpeed == nil then Originals.WalkSpeed = hum.WalkSpeed end
+				if Originals.JumpPower == nil then Originals.JumpPower = hum.JumpPower end
+			end
+		end)
+	end))
+end
+
+-- Hedef önceliği
+local TargetPriority = "Crosshair"
+local LockedTarget = nil
+
+local function getLocalRoot()
+	local char = LocalPlayer and LocalPlayer.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if root ~= nil and root:IsA("BasePart") then
+		return root
+	end
+	return nil
+end
+
+local function findPlayers(query)
+	local out = {}
+	if type(query) ~= "string" or #query < 1 then
+		return out
+	end
+	local needle = string.lower(query)
+	for _, p in ipairs(Players:GetPlayers()) do
+		local name = ""
+		local disp = ""
+		pcall(function() name = p.Name end)
+		pcall(function() disp = p.DisplayName end)
+		if string.find(string.lower(name .. " " .. disp), needle, 1, true) ~= nil then
+			table.insert(out, p)
+		end
+	end
+	return out
+end
+
+local function hasLineOfSight(fromPos, toPos, targetModel)
+	local dir = toPos - fromPos
+	if dir.Magnitude < 0.001 then
+		return true
+	end
+	local ignore = {}
+	if LocalPlayer ~= nil and LocalPlayer.Character ~= nil then
+		table.insert(ignore, LocalPlayer.Character)
+	end
+	if targetModel ~= nil then
+		table.insert(ignore, targetModel)
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.IgnoreWater = true
+	if #ignore > 0 then
+		params.FilterDescendantsInstances = ignore
+	end
+	local ok, result = pcall(function()
+		return Workspace:Raycast(fromPos, dir, params)
+	end)
+	if not ok then
+		return false
+	end
+	if result == nil then
+		return true
+	end
+	return (result.Position - toPos).Magnitude <= 2
+end
+
+local function isValidTarget(player)
+	if player == nil or player.Parent == nil then
+		return false
+	end
+	if player == LocalPlayer then
+		return false
+	end
+	local char = player.Character
+	if char == nil then
+		return false
+	end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if hum == nil then
+		return false
+	end
+	local hpOk, hp = pcall(function() return hum.Health end)
+	if not hpOk or hp <= 0 then
+		return false
+	end
+	-- Takım kontrolü
+	local sameTeam = false
+	pcall(function()
+		sameTeam = (LocalPlayer.Team ~= nil and LocalPlayer.Team == player.Team)
+	end)
+	if sameTeam then
+		return false
+	end
+	-- Mesafe (500)
+	local lroot = getLocalRoot()
+	local troot = char:FindFirstChild("HumanoidRootPart")
+	if lroot ~= nil and troot ~= nil and troot:IsA("BasePart") then
+		if (lroot.Position - troot.Position).Magnitude > 500 then
+			return false
+		end
+	end
+	-- Görünürlük
+	local cam = Workspace.CurrentCamera
+	if cam ~= nil and troot ~= nil and troot:IsA("BasePart") then
+		if not hasLineOfSight(cam.CFrame.Position, troot.Position, char) then
+			return false
+		end
+	end
+	return true
+end
+
+local function screenDist(player)
+	local cam = Workspace.CurrentCamera
+	if cam == nil then
+		return nil
+	end
+	local char = player.Character
+	local part = char and char:FindFirstChild("HumanoidRootPart")
+	if part == nil or not part:IsA("BasePart") then
+		return nil
+	end
+	local ok, vec, onScreen = pcall(function()
+		return cam:WorldToViewportPoint(part.Position)
+	end)
+	if not ok or onScreen == false then
+		return nil
+	end
+	local okM, mouse = pcall(function()
+		return UserInputService:GetMouseLocation()
+	end)
+	if not okM then
+		return nil
+	end
+	return (Vector2.new(vec.X, vec.Y) - mouse).Magnitude
+end
+
+local function getBestTarget()
+	local best = nil
+	if TargetPriority == "Distance" then
+		local bestD = math.huge
+		local lroot = getLocalRoot()
+		for _, p in ipairs(Players:GetPlayers()) do
+			if isValidTarget(p) then
+				local char = p.Character
+				local troot = char and char:FindFirstChild("HumanoidRootPart")
+				if lroot ~= nil and troot ~= nil and troot:IsA("BasePart") then
+					local d = (lroot.Position - troot.Position).Magnitude
+					if d < bestD then
+						bestD = d
+						best = p
+					end
+				end
+			end
+		end
+	elseif TargetPriority == "LowestHealth" then
+		local bestH = math.huge
+		for _, p in ipairs(Players:GetPlayers()) do
+			if isValidTarget(p) then
+				local hum = p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+				if hum ~= nil then
+					local ok, hp = pcall(function() return hum.Health end)
+					if ok and hp < bestH then
+						bestH = hp
+						best = p
+					end
+				end
+			end
+		end
+	else
+		local bestS = 120
+		for _, p in ipairs(Players:GetPlayers()) do
+			if isValidTarget(p) then
+				local sd = screenDist(p)
+				if sd ~= nil and sd <= bestS then
+					bestS = sd
+					best = p
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function doPanic(windowRef)
+	LockedTarget = nil
+	ESPOn = false
+	FlyOn = false
+	AimOn = false
+	TrigOn = false
+	RepOn = false
+	WSOn = false
+	InfJumpOn = false
+	if ESPFolder ~= nil then
+		pcall(function() ESPFolder:Destroy() end)
+		ESPFolder = nil
+	end
+	if XHairGui ~= nil then
+		pcall(function() XHairGui:Destroy() end)
+		XHairGui = nil
+		XHairParts = {}
+	end
+	local char = LocalPlayer and LocalPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum ~= nil then
+		if Originals.WalkSpeed ~= nil then
+			pcall(function() hum.WalkSpeed = Originals.WalkSpeed end)
+		end
+		if Originals.JumpPower ~= nil then
+			pcall(function() hum.JumpPower = Originals.JumpPower end)
+		end
+	end
+	untrackAll()
+	if windowRef ~= nil then
+		pcall(function()
+			windowRef:Notify({ Title = "Panic", Description = "Disabled, values restored", Lifetime = 3 })
+		end)
+	end
+	-- Panic tuşunu geri bağla
+	track("PanicKey", UserInputService.InputBegan:Connect(function(input, gpe)
+		if not gpe and input.KeyCode == Enum.KeyCode.F8 then
+			doPanic(windowRef)
+		end
+	end))
+end
+
+-- MacLib yükle
+if type(loadstring) ~= "function" then
+	warn("[Toolkit] loadstring yok, menü açılamaz")
+	return
+end
+local okSrc, src = pcall(function()
+	return game:HttpGet("https://github.com/biggaboy212/Maclib/releases/latest/download/maclib.txt")
+end)
+if not okSrc then
+	warn("[Toolkit] MacLib indirilemedi: " .. tostring(src))
+	return
+end
+local okLib, MacLib = pcall(function()
+	return loadstring(src)()
+end)
+if not okLib or MacLib == nil then
+	warn("[Toolkit] MacLib yüklenemedi")
+	return
+end
+MacLib.Folder = "UniversalToolkit"
+
+local okWin, Window = pcall(function()
+	return MacLib:Window({
+		Title = "Universal Toolkit",
+		Subtitle = "Phase 2",
+		Size = UDim2.fromOffset(868, 650),
+		DragStyle = 1,
+		DisabledWindowControls = {},
+		ShowUserInfo = true,
+		Keybind = Enum.KeyCode.RightShift,
+		AcrylicBlur = true,
+	})
+end)
+if not okWin or Window == nil then
+	warn("[Toolkit] Window açılamadı")
+	return
+end
+
+local TabGroup = Window:TabGroup()
+local Tabs = {}
+for _, name in ipairs({ "Combat", "Visuals", "Players", "Movement", "World", "Automation", "Misc", "Settings", "Config", "Debug", "About" }) do
+	local okT, tab = pcall(function()
+		return TabGroup:Tab({ Name = name })
+	end)
+	if okT and tab ~= nil then
+		Tabs[name] = tab
+	end
+end
+
+local function makeSection(tabName, side)
+	local tab = Tabs[tabName]
+	if tab == nil then
+		return nil
+	end
+	local okS, sec = pcall(function()
+		return tab:Section({ Side = side })
+	end)
+	if okS then
+		return sec
+	end
+	return nil
+end
+
+-- Players sekmesi
+do
+	local left = makeSection("Players", "Left")
+	if left ~= nil then
+		left:Input({
+			Name = "Player Search",
+			Placeholder = "isim yaz...",
+			AcceptedCharacters = "All",
+			Callback = function(input)
+				local found = findPlayers(input)
+				Window:Notify({ Title = "Players", Description = "Found: " .. tostring(#found), Lifetime = 3 })
+			end,
+		}, "PlayerSearchInput")
+
+		left:Dropdown({
+			Name = "Target Priority",
+			Search = false,
+			Multi = false,
+			Required = true,
+			Options = { "Crosshair", "Distance", "LowestHealth" },
+			Default = 1,
+			Callback = function(value)
+				if type(value) == "string" then
+					TargetPriority = value
+				end
+			end,
+		}, "TargetPriorityDropdown")
+
+		left:Toggle({
+			Name = "Target Lock",
+			Default = false,
+			Callback = function(v)
+				if v then
+					LockedTarget = getBestTarget()
+				else
+					LockedTarget = nil
+				end
+			end,
+		}, "TargetLockToggle")
+	end
+	local right = makeSection("Players", "Right")
+	if right ~= nil then
+		right:Button({
+			Name = "Print Player Count",
+			Callback = function()
+				Window:Notify({ Title = "Players", Description = "Count: " .. tostring(#Players:GetPlayers()), Lifetime = 3 })
+			end,
+		})
+		right:Button({
+			Name = "Print Best Target",
+			Callback = function()
+				local t = getBestTarget()
+				local label = "none"
+				if t ~= nil then
+					pcall(function() label = t.DisplayName .. " (@" .. t.Name .. ")" end)
+				end
+				Window:Notify({ Title = "Targeting", Description = "Best: " .. label, Lifetime = 3 })
+			end,
+		})
+	end
+end
+
+-- Settings sekmesi
+do
+	local s = makeSection("Settings", "Left")
+	if s ~= nil then
+		s:Button({
+			Name = "Panic (F8)",
+			Callback = function()
+				doPanic(Window)
+			end,
+		})
+		s:Button({
+			Name = "Unload",
+			Callback = function()
+				LockedTarget = nil
+				ESPOn = false
+				FlyOn = false
+				AimOn = false
+				TrigOn = false
+				RepOn = false
+				WSOn = false
+				InfJumpOn = false
+				if ESPFolder ~= nil then
+					pcall(function() ESPFolder:Destroy() end)
+					ESPFolder = nil
+				end
+				if XHairGui ~= nil then
+					pcall(function() XHairGui:Destroy() end)
+					XHairGui = nil
+				end
+				applyWalkSpeed()
+				untrackAll()
+				print("[Toolkit] Unloaded.")
+			end,
+		})
+	end
+end
+
+-- Config sekmesi (bellek + dosya varsa dosya)
+local MemConfig = { TargetPriority = "Crosshair" }
+do
+	local c = makeSection("Config", "Left")
+	if c ~= nil then
+		c:Button({
+			Name = "Save default",
+			Callback = function()
+				MemConfig.TargetPriority = TargetPriority
+				if type(writefile) == "function" then
+					pcall(function()
+						writefile("UniversalToolkit_default.json", HttpService:JSONEncode(MemConfig))
+					end)
+				end
+				Window:Notify({ Title = "Config", Description = "Saved", Lifetime = 3 })
+			end,
+		})
+		c:Button({
+			Name = "Load default",
+			Callback = function()
+				if type(readfile) == "function" and type(isfile) == "function" then
+					local okE = pcall(function() return isfile("UniversalToolkit_default.json") end)
+					if okE then
+						local okR, content = pcall(function() return readfile("UniversalToolkit_default.json") end)
+						if okR then
+							local okJ, data = pcall(function() return HttpService:JSONDecode(content) end)
+							if okJ and type(data) == "table" and type(data.TargetPriority) == "string" then
+								TargetPriority = data.TargetPriority
+							end
+						end
+					end
+				end
+				Window:Notify({ Title = "Config", Description = "Loaded, priority: " .. tostring(TargetPriority), Lifetime = 3 })
+			end,
+		})
+	end
+end
+
+-- Debug sekmesi
+do
+	local d = makeSection("Debug", "Left")
+	if d ~= nil then
+		d:Button({
+			Name = "Log Status",
+			Callback = function()
+				local char = LocalPlayer and LocalPlayer.Character
+				local hum = char and char:FindFirstChildOfClass("Humanoid")
+				local hp = 0
+				pcall(function() hp = hum.Health end)
+				print("[Toolkit] HP:", hp, "Locked:", LockedTarget and LockedTarget.Name or "none", "Players:", #Players:GetPlayers())
+			end,
+		})
+	end
+end
+
+-- ================= PHASE 3: ESP + Crosshair =================
+ESPOn = false
+ESPMaxDist = 500
+ESPTeamColors = true
+ESPColor = Color3.fromRGB(255, 255, 255)
+ESPFolder = nil
+
+local function espRebuild()
+	if ESPFolder ~= nil then
+		pcall(function() ESPFolder:Destroy() end)
+		ESPFolder = nil
+	end
+	if not ESPOn then
+		return
+	end
+	local folder = Instance.new("Folder")
+	folder.Name = "UTK_ESP"
+	folder.Parent = Workspace
+	ESPFolder = folder
+	local lr = getLocalRoot()
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LocalPlayer then
+			local char = p.Character
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if hum ~= nil then
+				local hpOk, hp = pcall(function() return hum.Health end)
+				if hpOk and hp > 0 then
+					local hrp = char:FindFirstChild("HumanoidRootPart")
+					local dist = 0
+					if lr ~= nil and hrp ~= nil and hrp:IsA("BasePart") then
+						dist = (lr.Position - hrp.Position).Magnitude
+					end
+					if dist <= ESPMaxDist then
+						local color = ESPColor
+						if ESPTeamColors then
+							pcall(function() color = p.TeamColor.Color end)
+						end
+						local hl = Instance.new("Highlight")
+						hl.Adornee = char
+						hl.FillColor = color
+						hl.FillTransparency = 0.6
+						hl.OutlineColor = color
+						hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+						hl.Parent = folder
+						local head = char:FindFirstChild("Head")
+						if head ~= nil and head:IsA("BasePart") then
+							local bb = Instance.new("BillboardGui")
+							bb.Adornee = head
+							bb.Size = UDim2.fromOffset(120, 32)
+							bb.StudsOffset = Vector3.new(0, 1.5, 0)
+							bb.AlwaysOnTop = true
+							local tl = Instance.new("TextLabel")
+							tl.BackgroundTransparency = 1
+							tl.Size = UDim2.fromScale(1, 1)
+							tl.Font = Enum.Font.GothamBold
+							tl.TextSize = 12
+							tl.TextStrokeTransparency = 0.5
+							tl.TextColor3 = color
+							tl.Text = p.DisplayName .. " (" .. math.floor(dist) .. "m)"
+							tl.Parent = bb
+							bb.Parent = folder
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+XHairOn = false
+XHairGui = nil
+XHairParts = {}
+XHairSize = 12
+XHairGap = 6
+XHairColor = Color3.fromRGB(0, 255, 0)
+
+local function xhairRefresh()
+	if XHairParts.Top == nil then
+		return
+	end
+	XHairParts.Top.Size = UDim2.fromOffset(2, XHairSize)
+	XHairParts.Top.Position = UDim2.new(0.5, 0, 0.5, -(XHairGap + XHairSize / 2))
+	XHairParts.Bottom.Size = UDim2.fromOffset(2, XHairSize)
+	XHairParts.Bottom.Position = UDim2.new(0.5, 0, 0.5, (XHairGap + XHairSize / 2))
+	XHairParts.Left.Size = UDim2.fromOffset(XHairSize, 2)
+	XHairParts.Left.Position = UDim2.new(0.5, -(XHairGap + XHairSize / 2), 0.5, 0)
+	XHairParts.Right.Size = UDim2.fromOffset(XHairSize, 2)
+	XHairParts.Right.Position = UDim2.new(0.5, (XHairGap + XHairSize / 2), 0.5, 0)
+	XHairParts.Dot.Size = UDim2.fromOffset(2, 2)
+	XHairParts.Dot.Position = UDim2.new(0.5, 0, 0.5, 0)
+	for _, f in pairs(XHairParts) do
+		f.BackgroundColor3 = XHairColor
+	end
+end
+
+local function xhairSet(on)
+	XHairOn = on
+	if XHairGui ~= nil then
+		pcall(function() XHairGui:Destroy() end)
+		XHairGui = nil
+		XHairParts = {}
+	end
+	if not on then
+		return
+	end
+	local parent = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if parent == nil then
+		return
+	end
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "UTK_Crosshair"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 9999
+	for _, n in ipairs({ "Top", "Bottom", "Left", "Right", "Dot" }) do
+		local f = Instance.new("Frame")
+		f.Name = n
+		f.BorderSizePixel = 0
+		f.AnchorPoint = Vector2.new(0.5, 0.5)
+		f.Parent = gui
+		XHairParts[n] = f
+	end
+	xhairRefresh()
+	gui.Parent = parent
+	XHairGui = gui
+end
+
+do
+	local v = makeSection("Visuals", "Left")
+	if v ~= nil then
+		v:Toggle({ Name = "Player ESP", Default = false, Callback = function(on)
+			ESPOn = on
+			if on then
+				task.spawn(function()
+					while ESPOn do
+						task.wait(0.25)
+						if ESPOn then
+							pcall(espRebuild)
+						end
+					end
+				end)
+			end
+			pcall(espRebuild)
+		end }, "ESP_Toggle")
+		v:Slider({ Name = "ESP Max Distance", Default = 500, Minimum = 50, Maximum = 2000, DisplayMethod = "Value", Precision = 0, Callback = function(val)
+			ESPMaxDist = val
+		end }, "ESP_Dist")
+		v:Toggle({ Name = "Team Colors", Default = true, Callback = function(on)
+			ESPTeamColors = on
+		end }, "ESP_Team")
+		v:Toggle({ Name = "Crosshair", Default = false, Callback = function(on)
+			xhairSet(on)
+		end }, "XHair_Toggle")
+		v:Slider({ Name = "Crosshair Size", Default = 12, Minimum = 4, Maximum = 40, DisplayMethod = "Value", Precision = 0, Callback = function(val)
+			XHairSize = val
+			xhairRefresh()
+		end }, "XHair_Size")
+	end
+end
+
+-- ================= PHASE 4: Movement + Camera =================
+WSOn = false
+WSVal = 16
+OrigWS = OrigWS or Originals.WalkSpeed
+OrigJP = OrigJP or Originals.JumpPower
+FlyOn = false
+FlySpeed = 50
+InfJumpOn = false
+
+local function applyWalkSpeed()
+	local char = LocalPlayer and LocalPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum == nil then
+		return
+	end
+	if WSOn then
+		pcall(function() hum.WalkSpeed = WSVal end)
+	elseif OrigWS ~= nil then
+		pcall(function() hum.WalkSpeed = OrigWS end)
+	end
+end
+
+track("InfJump", UserInputService.JumpRequest:Connect(function()
+	if InfJumpOn then
+		local char = LocalPlayer and LocalPlayer.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if hum ~= nil then
+			pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+		end
+	end
+end))
+
+if LocalPlayer ~= nil then
+	track("WSRespawn", LocalPlayer.CharacterAdded:Connect(function()
+		task.defer(function()
+			task.wait(0.5)
+			applyWalkSpeed()
+		end)
+	end))
+end
+
+do
+	local m = makeSection("Movement", "Left")
+	if m ~= nil then
+		m:Toggle({ Name = "WalkSpeed Override", Default = false, Callback = function(on)
+			WSOn = on
+			applyWalkSpeed()
+		end }, "WS_Toggle")
+		m:Slider({ Name = "WalkSpeed", Default = 16, Minimum = 16, Maximum = 200, DisplayMethod = "Value", Precision = 0, Callback = function(val)
+			WSVal = val
+			applyWalkSpeed()
+		end }, "WS_Slider")
+		m:Slider({ Name = "JumpPower", Default = 50, Minimum = 0, Maximum = 300, DisplayMethod = "Value", Precision = 0, Callback = function(val)
+			local char = LocalPlayer and LocalPlayer.Character
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if hum ~= nil then
+				pcall(function() hum.JumpPower = val end)
+			end
+		end }, "JP_Slider")
+		m:Toggle({ Name = "Fly (WASD+Space/Shift)", Default = false, Callback = function(on)
+			FlyOn = on
+			if on then
+				local RunService = game:GetService("RunService")
+				track("FlyLoop", RunService.Heartbeat:Connect(function(dt)
+					if not FlyOn then
+						return
+					end
+					local char = LocalPlayer and LocalPlayer.Character
+					local root = char and char:FindFirstChild("HumanoidRootPart")
+					local cam = Workspace.CurrentCamera
+					if root == nil or cam == nil or not root:IsA("BasePart") then
+						return
+					end
+					local move = Vector3.new(0, 0, 0)
+					if UserInputService:IsKeyDown(Enum.KeyCode.W) then move = move + cam.CFrame.LookVector end
+					if UserInputService:IsKeyDown(Enum.KeyCode.S) then move = move - cam.CFrame.LookVector end
+					if UserInputService:IsKeyDown(Enum.KeyCode.A) then move = move - cam.CFrame.RightVector end
+					if UserInputService:IsKeyDown(Enum.KeyCode.D) then move = move + cam.CFrame.RightVector end
+					if UserInputService:IsKeyDown(Enum.KeyCode.Space) then move = move + Vector3.new(0, 1, 0) end
+					if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then move = move - Vector3.new(0, 1, 0) end
+					if move.Magnitude > 0 then
+						root.CFrame = root.CFrame + (move.Unit * FlySpeed * dt)
+					end
+					root.Velocity = Vector3.new(0, 0, 0)
+				end))
+			else
+				if Conns["FlyLoop"] ~= nil then
+					pcall(function() Conns["FlyLoop"]:Disconnect() end)
+					Conns["FlyLoop"] = nil
+				end
+			end
+		end }, "Fly_Toggle")
+		m:Slider({ Name = "Fly Speed", Default = 50, Minimum = 10, Maximum = 300, DisplayMethod = "Value", Precision = 0, Callback = function(val)
+			FlySpeed = val
+		end }, "Fly_Speed")
+		m:Toggle({ Name = "Infinite Jump", Default = false, Callback = function(on)
+			InfJumpOn = on
+		end }, "InfJump_Toggle")
+	end
+	local cm = makeSection("Movement", "Right")
+	if cm ~= nil then
+		cm:Slider({ Name = "Camera FOV", Default = 70, Minimum = 30, Maximum = 120, DisplayMethod = "Value", Precision = 0, Callback = function(val)
+			local cam = Workspace.CurrentCamera
+			if cam ~= nil then
+				pcall(function() cam.FieldOfView = val end)
+			end
+		end }, "FOV_Slider")
+		cm:Dropdown({ Name = "FOV Preset", Search = false, Multi = false, Required = false, Options = { "70 Normal", "90 Wide", "120 Ultra" }, Default = 1, Callback = function(val)
+			local map = { ["70 Normal"] = 70, ["90 Wide"] = 90, ["120 Ultra"] = 120 }
+			local cam = Workspace.CurrentCamera
+			if cam ~= nil and map[val] ~= nil then
+				pcall(function() cam.FieldOfView = map[val] end)
+			end
+		end }, "FOV_Preset")
+		cm:Button({ Name = "Reset Camera", Callback = function()
+			local cam = Workspace.CurrentCamera
+			if cam ~= nil then
+				if Originals.FOV ~= nil then
+					pcall(function() cam.FieldOfView = Originals.FOV end)
+				else
+					pcall(function() cam.FieldOfView = 70 end)
+				end
+			end
+		end })
+	end
+end
+
+-- ================= PHASE 5: Aim Assist + Trigger =================
+AimOn = false
+AimSmooth = 0.2
+AimFOV = 120
+TrigOn = false
+TrigDelay = 0.15
+TrigCD = 0.5
+TrigLast = 0
+
+do
+	local c = makeSection("Combat", "Left")
+	if c ~= nil then
+		c:Toggle({ Name = "Aim Assist (hold RMB)", Default = false, Callback = function(on)
+			AimOn = on
+			if on then
+				local RunService = game:GetService("RunService")
+				track("AimLoop", RunService.RenderStepped:Connect(function()
+					if not AimOn then
+						return
+					end
+					local holding = false
+					pcall(function()
+						holding = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+					end)
+					if not holding then
+						return
+					end
+					local cam = Workspace.CurrentCamera
+					if cam == nil then
+						return
+					end
+					local best, bestD = nil, AimFOV
+					local okM, mouse = pcall(function() return UserInputService:GetMouseLocation() end)
+					if not okM then
+						return
+					end
+					for _, p in ipairs(Players:GetPlayers()) do
+						if isValidTarget(p) then
+							local char = p.Character
+							local head = char and (char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart"))
+							if head ~= nil and head:IsA("BasePart") then
+								local ok, vec, onScr = pcall(function() return cam:WorldToViewportPoint(head.Position) end)
+								if ok and onScr then
+									local d = (Vector2.new(vec.X, vec.Y) - mouse).Magnitude
+									if d < bestD then
+										bestD = d
+										best = head
+									end
+								end
+							end
+						end
+					end
+					if best ~= nil then
+						local goal = CFrame.new(cam.CFrame.Position, best.Position)
+						cam.CFrame = cam.CFrame:Lerp(goal, math.clamp(AimSmooth, 0.01, 1))
+					end
+				end))
+			else
+				if Conns["AimLoop"] ~= nil then
+					pcall(function() Conns["AimLoop"]:Disconnect() end)
+					Conns["AimLoop"] = nil
+				end
+			end
+		end }, "Aim_Toggle")
+		c:Slider({ Name = "Aim Smoothness", Default = 20, Minimum = 1, Maximum = 100, DisplayMethod = "Percent", Precision = 0, Callback = function(val)
+			AimSmooth = val / 100
+		end }, "Aim_Smooth")
+		c:Slider({ Name = "Aim FOV", Default = 120, Minimum = 30, Maximum = 400, DisplayMethod = "Value", Precision = 0, Callback = function(val)
+			AimFOV = val
+		end }, "Aim_FOV")
+		c:Toggle({ Name = "Trigger Bot", Default = false, Callback = function(on)
+			if on and type(mouse1click) ~= "function" then
+				Window:Notify({ Title = "Trigger", Description = "Unavailable (mouse1click missing)", Lifetime = 3 })
+				return
+			end
+			TrigOn = on
+			if on then
+				task.spawn(function()
+					while TrigOn do
+						task.wait(TrigDelay)
+						if not TrigOn then
+							break
+						end
+						if os.clock() - TrigLast >= TrigCD then
+							local cam = Workspace.CurrentCamera
+							local okM, mouse = pcall(function() return UserInputService:GetMouseLocation() end)
+							if cam ~= nil and okM then
+								for _, p in ipairs(Players:GetPlayers()) do
+									if isValidTarget(p) then
+										local char = p.Character
+										local head = char and (char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart"))
+										if head ~= nil and head:IsA("BasePart") then
+											local ok, vec, onScr = pcall(function() return cam:WorldToViewportPoint(head.Position) end)
+											if ok and onScr and (Vector2.new(vec.X, vec.Y) - mouse).Magnitude <= 60 then
+												TrigLast = os.clock()
+												pcall(function() mouse1click() end)
+												break
+											end
+										end
+									end
+								end
+							end
+						end
+					end
+				end)
+			end
+		end }, "Trig_Toggle")
+	end
+end
+
+-- ================= PHASE 6: Automation + Performance =================
+RepOn = false
+RepInterval = 1
+RepCount = 0
+
+do
+	local a = makeSection("Automation", "Left")
+	if a ~= nil then
+		a:Slider({ Name = "Click Interval (s)", Default = 1, Minimum = 0, Maximum = 10, DisplayMethod = "Value", Precision = 1, Callback = function(val)
+			RepInterval = val
+		end }, "Rep_Interval")
+		a:Toggle({ Name = "Click Repeater", Default = false, Callback = function(on)
+			if on and type(mouse1click) ~= "function" then
+				Window:Notify({ Title = "Automation", Description = "Unavailable (mouse1click missing)", Lifetime = 3 })
+				return
+			end
+			RepOn = on
+			if on then
+				task.spawn(function()
+					while RepOn do
+						task.wait(math.max(RepInterval, 0.05))
+						if RepOn then
+							pcall(function() mouse1click() end)
+							RepCount = RepCount + 1
+						end
+					end
+				end)
+			end
+		end }, "Rep_Toggle")
+		a:Button({ Name = "Emergency Stop", Callback = function()
+			RepOn = false
+			TrigOn = false
+			Window:Notify({ Title = "Automation", Description = "Stopped. Clicks: " .. tostring(RepCount), Lifetime = 3 })
+		end })
+	end
+	local pf = makeSection("Misc", "Left")
+	if pf ~= nil then
+		pf:Button({ Name = "Log Performance", Callback = function()
+			local frames = 0
+			local RunService = game:GetService("RunService")
+			local c = RunService.RenderStepped:Connect(function() frames = frames + 1 end)
+			task.wait(1)
+			pcall(function() c:Disconnect() end)
+			print("[Toolkit] FPS:", frames, "Players:", #Players:GetPlayers(), "ESP objs:", ESPFolder and #ESPFolder:GetChildren() or 0, "Clicks:", RepCount)
+			Window:Notify({ Title = "Performance", Description = "FPS: " .. tostring(frames), Lifetime = 3 })
+		end })
+	end
+end
+
+-- ================= PHASE 7: Theme + About =================
+local Themes = {
+	["Mac Dark"] = { ESP = Color3.fromRGB(255, 255, 255), XHair = Color3.fromRGB(0, 255, 0) },
+	["Midnight"] = { ESP = Color3.fromRGB(150, 180, 255), XHair = Color3.fromRGB(88, 101, 242) },
+	["Purple"] = { ESP = Color3.fromRGB(200, 140, 255), XHair = Color3.fromRGB(200, 120, 255) },
+	["Red"] = { ESP = Color3.fromRGB(255, 120, 120), XHair = Color3.fromRGB(255, 60, 60) },
+	["Green"] = { ESP = Color3.fromRGB(140, 255, 140), XHair = Color3.fromRGB(50, 255, 50) },
+	["Blue"] = { ESP = Color3.fromRGB(140, 200, 255), XHair = Color3.fromRGB(60, 180, 255) },
+	["Monochrome"] = { ESP = Color3.fromRGB(230, 230, 230), XHair = Color3.fromRGB(255, 255, 255) },
+}
+
+do
+	local s = makeSection("Settings", "Right")
+	if s ~= nil then
+		s:Dropdown({ Name = "Theme", Search = false, Multi = false, Required = true, Options = { "Mac Dark", "Midnight", "Purple", "Red", "Green", "Blue", "Monochrome" }, Default = 1, Callback = function(val)
+			local t = Themes[val]
+			if t ~= nil then
+				ESPColor = t.ESP
+				XHairColor = t.XHair
+				xhairRefresh()
+				pcall(espRebuild)
+			end
+		end }, "Theme_Dropdown")
+		s:Keybind({ Name = "Target Lock Key", Default = Enum.KeyCode.T, Callback = function()
+			LockedTarget = getBestTarget()
+			local label = "none"
+			if LockedTarget ~= nil then
+				pcall(function() label = LockedTarget.Name end)
+			end
+			Window:Notify({ Title = "Target", Description = "Locked: " .. label, Lifetime = 3 })
+		end }, "TargetLock_Key")
+	end
+	local ab = makeSection("About", "Left")
+	if ab ~= nil then
+		ab:Label({ Text = "Universal Toolkit v0.3 (Phase 1-7)" })
+		ab:Paragraph({ Header = "Kullanim", Body = "Menu: RightShift. Panic: F8. Tum ozellikler client-side test amacli." })
+	end
+end
+
+-- Panic tuşu
+track("PanicKey", UserInputService.InputBegan:Connect(function(input, gpe)
+	if not gpe and input.KeyCode == Enum.KeyCode.F8 then
+		doPanic(Window)
+	end
+end))
+
+if Tabs["Players"] ~= nil then
+	pcall(function() Tabs["Players"]:Select() end)
+end
+Window:Notify({ Title = "Universal Toolkit", Description = "All phases loaded", Lifetime = 5 })

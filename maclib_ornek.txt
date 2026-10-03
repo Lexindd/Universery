@@ -1,0 +1,178 @@
+-- Bağımlılık: Bu yükleme satırı executor gerektirir (loadstring + game:HttpGet)
+local MacLib = loadstring(game:HttpGet("https://github.com/biggaboy212/Maclib/releases/latest/download/maclib.txt"))()
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+-- Not: MacLib:SetFolder() bu sürümde Window'dan önce çağrılamıyor.
+-- Bu yüzden klasörü doğrudan alan olarak ayarlıyoruz.
+MacLib.Folder = "MacLibOrnek"
+
+local Window = MacLib:Window({
+    Title = "Ornek Hub",
+    Subtitle = "v1.0",
+    Size = UDim2.fromOffset(868, 650),
+    DragStyle = 1,
+    DisabledWindowControls = {},
+    ShowUserInfo = true,
+    Keybind = Enum.KeyCode.RightShift,
+    AcrylicBlur = true,
+})
+
+local TabGroup = Window:TabGroup()
+
+-- 1. Tab: Ana
+local MainTab = TabGroup:Tab({
+    Name = "Ana",
+})
+
+local LeftSection = MainTab:Section({ Side = "Left" })
+local RightSection = MainTab:Section({ Side = "Right" })
+
+LeftSection:Header({
+    Text = "Karakter",
+})
+
+LeftSection:Paragraph({
+    Header = "Bilgi",
+    Body = "Bu bölüm karakter ayarları içerir.",
+})
+
+local WalkSpeedSlider = LeftSection:Slider({
+    Name = "WalkSpeed",
+    Default = 16,
+    Minimum = 16,
+    Maximum = 100,
+    DisplayMethod = "Value",
+    Precision = 0,
+    Callback = function(Value)
+        local character = LocalPlayer.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            humanoid.WalkSpeed = Value
+        end
+    end,
+}, "WalkSpeedSlider")
+
+LeftSection:Toggle({
+    Name = "Bildirimler",
+    Default = true,
+    Callback = function(Value)
+        print("Bildirimler:", Value)
+    end,
+}, "BildirimToggle")
+
+RightSection:Button({
+    Name = "Selam Ver",
+    Callback = function()
+        Window:Notify({
+            Title = "Ornek Hub",
+            Description = "Merhaba, " .. LocalPlayer.DisplayName,
+            Lifetime = 3,
+        })
+    end,
+})
+
+RightSection:Dropdown({
+    Name = "Silah Ver",
+    Search = true,
+    Multi = false,
+    Required = false,
+    Options = { "AK-47", "M4A1", "AWP" },
+    Default = 1,
+    Callback = function(Value)
+        print("Secilen:", Value)
+    end,
+}, "SilahDropdown")
+
+RightSection:Input({
+    Name = "Hedef Oyuncu",
+    Placeholder = "Kullanici adi yaz",
+    AcceptedCharacters = "All",
+    Callback = function(input)
+        print("Hedef:", input)
+    end,
+}, "HedefInput")
+
+-- 2. Tab: Ayarlar
+local SettingsTab = TabGroup:Tab({
+    Name = "Ayarlar",
+})
+
+local SettingsLeft = SettingsTab:Section({ Side = "Left" })
+local SettingsRight = SettingsTab:Section({ Side = "Right" })
+
+SettingsLeft:Label({
+    Text = "Görünüm ayarları aşağıda:",
+})
+
+SettingsLeft:Colorpicker({
+    Name = "ESP Rengi",
+    Default = Color3.fromRGB(255, 0, 0),
+    Alpha = 0,
+    Callback = function(color, alpha)
+        print("Renk:", color, "Alpha:", alpha)
+    end,
+}, "ESPRenk")
+
+SettingsLeft:Keybind({
+    Name = "Menüyü Aç / Kapat",
+    Default = Enum.KeyCode.RightShift,
+    Callback = function(binded)
+        print("Keybind tetiklendi:", binded)
+    end,
+    onBinded = function(bind)
+        Window:Notify({
+            Title = "Ornek Hub",
+            Description = "Yeni tus: " .. tostring(bind.Name),
+            Lifetime = 3,
+        })
+    end,
+}, "MenuKeybind")
+
+SettingsRight:Button({
+    Name = "Dialog Test",
+    Callback = function()
+        Window:Dialog({
+            Title = "Ornek Hub",
+            Description = "Ayarlar sifirlansin mi?",
+            Buttons = {
+                {
+                    Name = "Evet",
+                    Callback = function()
+                        print("Onaylandi")
+                    end,
+                },
+                {
+                    Name = "Hayir",
+                },
+            },
+        })
+    end,
+})
+
+SettingsRight:Button({
+    Name = "Config Kaydet",
+    Callback = function()
+        if type(MacLib.SaveConfig) ~= "function" then
+            warn("SaveConfig bu sürümde yok")
+            return
+        end
+
+        local success, result = pcall(function()
+            return MacLib:SaveConfig("ornek")
+        end)
+
+        if not success then
+            warn(result)
+        end
+    end,
+})
+
+MainTab:Select()
+
+Window:Notify({
+    Title = "Ornek Hub",
+    Description = "Arayüz yüklendi!",
+    Lifetime = 5,
+})
