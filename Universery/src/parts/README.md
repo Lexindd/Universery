@@ -17,7 +17,13 @@ ranges follow the code automatically.
 | 15_SilentAim.luau | 3959-4599 | Features/SilentAim/* (controller, resolver, FOV, prediction, consult; hook engine moved to FireAdapter module) |
 | 16_APIExit.luau | 4600-4852 | Core/CleanupManager (Exit/Panic/Restart) + public API surface |
 | 17_AutoStart.luau | 4853-4886 | Main (boot call) |
-| 18_UIBuild.luau | 4887-end | UI/* + Config/Manager chain (Write/Syncers, all tabs, reset, debug loop) |
+| 18_UIBuild.luau | REMOVED M2b | split into 18a-f below |
+| 18a_UIInfra.luau | 4246-4444 | UI/Init infra (El, syncer, Write, maps, PushAllToAimbot) |
+| 18b_TabAimbot.luau | 4445-4984 | UI/Tabs/Aimbot.lua (aimbot + filters + smoothing + targeting + prediction + utility) |
+| 18c_TabESP.luau | 4985-5344 | UI/Tabs/ESP.lua (BuildESPTab) |
+| 18d_TabSilent.luau | 5345-5529 | UI/Tabs/SilentAim.lua (BuildSilentTab) |
+| 18e_TabDebug.luau | 5530-5617 | UI/Tabs/Debug.lua (target + network + silent labels + loop) |
+| 18f_TabSettings.luau | 5618-end | UI/Tabs/Settings.lua (menu + config + about + PushAll + build tag) |
 
 Rule: do NOT hand-edit logic here to "improve" things. Trunk edits go to
 universal_aimbot_maclib.txt, then re-run split + build. Refactors move code

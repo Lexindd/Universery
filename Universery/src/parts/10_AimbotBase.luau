@@ -126,7 +126,7 @@ end
 
 local PlayerCache, PlayerCacheTime = {}, 0
 local VisibilityCache = {}
-local FriendSet, FriendSetTime, FriendAPIUnavailable = {}, 0, false
+-- Friend/team caches live in Universery/Shared/TeamResolver.lua.
 local VelocityState = { Samples = {}, AvgVelocity = Vector3zero, SmoothVel = nil, Acceleration = Vector3zero, Confidence = 0, LastPos = nil, LastTime = 0, Stable = true }
 -- Network stats belong to the connection, NOT the target: never cleared on target change.
 local PingState = { Raw = 0, Smoothed = 0, Min = 0, Max = 0, Jitter = 0, Samples = {}, Quality = "Unknown", Correction = 1, ErrBuf = {}, LastPred = nil, Effective = 0, LastUpdate = 0, LastCalib = 0, Available = false }

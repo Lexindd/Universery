@@ -143,3 +143,16 @@ replaced by Build.ps1 (aimbot.txt is DIVERGED - do not rebuild from it).
 - Deferred to M2b: Shared/TeamResolver extraction, UI tab split, Scheduler/
   ConnectionManager/Config adoption, `Main.lua`/`Loader.lua`, foundation
   modules (currently return-style, not yet bundled).
+
+## 9. M2b status (Shared/TeamResolver + UI split + dist entrypoint)
+
+- Shared/TeamResolver.lua extracted verbatim (660 lines, dep-injected);
+  monolith keeps 8 one-line delegates (zero call-site churn).
+- UI build split into 6 tab files (18a-f); manifest updated.
+- Runnable entrypoint is now Universery/dist/Universery.lua (Phase 48);
+  trunk file is source-only (needs bundled registry).
+- dist built TWICE with identical hash (no duplication on rebuild).
+- Dead files moved to Universery/_archive/ (obsidian/universal_aimbot/
+  beforemethod/maclib_ornek); aimbot.txt + maclib_aimbot_ui.txt + exunys kept.
+- Deferred to M3: Shared/Prediction unify, Scheduler/ConnectionManager/Config
+  adoption, Main/Loader, foundation return-style modules bundling.

@@ -8,7 +8,7 @@ Environment.Exit = LPH_NO_VIRTUALIZE(function(self) -- ExunysDeveloperAimbot.Exi
 
 	PlayerCache = {}
 	VisibilityCache = {}
-	FriendSet = {}
+	Universery.TeamResolver.ResetFriends()
 	ResetTargetState()
 	pcall(function() ESPCleanup() end)
 	pcall(function()
@@ -119,8 +119,9 @@ end)
 -- manually from the results (Mode / ManualAttribute / ManualValuePath / adapter).
 Environment.ScanTeamSources = LPH_NO_VIRTUALIZE(function() -- ExunysDeveloperAimbot.ScanTeamSources(<void>)
 	AnalyzeSources(true)
+	local rank = Universery.TeamResolver.GetRanking()
 	local cfg = Environment.TeamResolver
-	_warn("[Aimbot] TEAM SCAN (mode " .. tostring(cfg.Mode) .. ", native-diverse: " .. tostring(TeamRanking.NativeDiverse) .. ")")
+	_warn("[Aimbot] TEAM SCAN (mode " .. tostring(cfg.Mode) .. ", native-diverse: " .. tostring(rank.NativeDiverse) .. ")")
 	local function dump(title, list, show)
 		_warn("[Aimbot] Possible " .. title .. ":")
 		if #list < 1 then
@@ -132,23 +133,23 @@ Environment.ScanTeamSources = LPH_NO_VIRTUALIZE(function() -- ExunysDeveloperAim
 			_warn("   " .. tostring(e.Key) .. " conf " .. string.format("%.2f", e.Conf) .. " distinct " .. tostring(e.Distinct))
 		end
 	end
-	dump("Team Attributes", TeamRanking.Attr)
-	dump("Values", TeamRanking.Value)
-	dump("Tags", TeamRanking.Tag)
+	dump("Team Attributes", rank.Attr)
+	dump("Values", rank.Value)
+	dump("Tags", rank.Tag)
 	local rec = "Native (meaningful)"
-	if not TeamRanking.NativeDiverse then
-		if #TeamRanking.Attr > 0 and TeamRanking.Attr[1].Conf >= (cfg.ConfidenceThreshold or 0.6) then
-			rec = "Attribute:" .. tostring(TeamRanking.Attr[1].Key)
-		elseif #TeamRanking.Value > 0 and TeamRanking.Value[1].Conf >= (cfg.ConfidenceThreshold or 0.6) then
-			rec = "Value:" .. tostring(TeamRanking.Value[1].Key)
-		elseif #TeamRanking.Tag > 0 and TeamRanking.Tag[1].Conf >= (cfg.ConfidenceThreshold or 0.6) then
-			rec = "Tag prefix:" .. tostring(TeamRanking.Tag[1].Key)
+	if not rank.NativeDiverse then
+		if #rank.Attr > 0 and rank.Attr[1].Conf >= (cfg.ConfidenceThreshold or 0.6) then
+			rec = "Attribute:" .. tostring(rank.Attr[1].Key)
+		elseif #rank.Value > 0 and rank.Value[1].Conf >= (cfg.ConfidenceThreshold or 0.6) then
+			rec = "Value:" .. tostring(rank.Value[1].Key)
+		elseif #rank.Tag > 0 and rank.Tag[1].Conf >= (cfg.ConfidenceThreshold or 0.6) then
+			rec = "Tag prefix:" .. tostring(rank.Tag[1].Key)
 		else
 			rec = "none confident - set ManualAttribute/ManualValuePath or a GameAdapter"
 		end
 	end
 	_warn("[Aimbot] Recommended source: " .. rec)
-	return { Attributes = TeamRanking.Attr, Values = TeamRanking.Value, Tags = TeamRanking.Tag, NativeDiverse = TeamRanking.NativeDiverse, Recommended = rec }
+	return { Attributes = rank.Attr, Values = rank.Value, Tags = rank.Tag, NativeDiverse = rank.NativeDiverse, Recommended = rec }
 end)
 
 Environment.GetTargetInfo = LPH_NO_VIRTUALIZE(function() -- ExunysDeveloperAimbot.GetTargetInfo(<void>)
@@ -187,7 +188,7 @@ Environment.GetDiagnostics = LPH_NO_VIRTUALIZE(function() -- ExunysDeveloperAimb
 	end
 	return {
 		Drawing = DrawingAvailable,
-		FriendAPI = not FriendAPIUnavailable,
+		FriendAPI = Universery.TeamResolver.FriendAPIOk(),
 		PlayersCached = #PlayerCache,
 		Locked = lockedName,
 		Running = Running,

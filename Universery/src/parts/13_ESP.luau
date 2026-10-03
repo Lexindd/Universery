@@ -979,9 +979,7 @@ local Load = function()
 	end))
 	-- Slow friend-list refresh (amortized, not per frame).
 	ServiceConnections.FriendRefresh = Connect(__index(RunService, UpdateMode), LPH_NO_VIRTUALIZE(function()
-		if (tick() - FriendSetTime) > 120 then
-			RefreshFriends()
-		end
+		Universery.TeamResolver.MaybeRefreshFriends()
 		if (tick() - PlayerCacheTime) > (Environment.Performance.PlayerReconcile or 2) then
 			RebuildPlayerCache()
 		end
